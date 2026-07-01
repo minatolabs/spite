@@ -31,10 +31,37 @@ npm --prefix ui install
 cargo tauri dev        # or: npm --prefix ui run tauri dev
 ```
 
+## Connecting your mailbox
+
+Spite does not ship a client_id yet, so you currently need your own (free)
+Entra app registration:
+
+1. [Entra ID → App registrations → New registration](https://entra.microsoft.com).
+   Name it anything; supported accounts: **multitenant** (any organizational
+   directory).
+2. Authentication → **Allow public client flows = Yes**. No client secret.
+3. API permissions → Microsoft Graph → Delegated: `Mail.Read`, `Mail.Send`,
+   `User.Read`. (`offline_access` is consented implicitly.)
+4. Copy the **Application (client) ID** into Spite's config file:
+
+```jsonc
+// Linux: ~/.config/com.minatolabs.spite/config.json
+{
+  "client_id": "<your-application-client-id>",
+  // optional; defaults to https://login.microsoftonline.com/common
+  "authority": "https://login.microsoftonline.com/organizations"
+}
+```
+
+Sign-in uses the OAuth 2.0 device-code flow: the app shows a code and
+`microsoft.com/devicelogin`; complete sign-in in any browser. The refresh
+token is stored in the OS keychain (Secret Service / Keychain / Credential
+Manager), never on disk.
+
 ## Roadmap (v0.1)
 
 - [x] Phase 0 — Tauri 2 scaffold
-- [ ] Phase 1 — MSAL device-code auth, tokens in OS keychain
+- [ ] Phase 1 — device-code auth, tokens in OS keychain
 - [ ] Phase 2 — local SQLite store + migrations
 - [ ] Phase 3 — Graph delta sync
 - [ ] Phase 4 — read UI (offline-capable list + message view)

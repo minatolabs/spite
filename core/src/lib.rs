@@ -3,6 +3,8 @@
 //! (`src-tauri`) is a thin IPC layer over this crate.
 
 pub mod auth;
+pub mod config;
+pub mod graph;
 pub mod store;
 pub mod sync;
 
