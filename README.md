@@ -61,7 +61,7 @@ Manager), never on disk.
 ## Roadmap (v0.1)
 
 - [x] Phase 0 — Tauri 2 scaffold
-- [ ] Phase 1 — device-code auth, tokens in OS keychain
+- [x] Phase 1 — device-code auth, tokens in OS keychain
 - [ ] Phase 2 — local SQLite store + migrations
 - [ ] Phase 3 — Graph delta sync
 - [ ] Phase 4 — read UI (offline-capable list + message view)
