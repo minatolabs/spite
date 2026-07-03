@@ -73,7 +73,7 @@ Manager), never on disk.
 - [x] Phase 0 — Tauri 2 scaffold
 - [x] Phase 1 — device-code auth, tokens in OS keychain
 - [x] Phase 2 — local SQLite store + migrations
-- [ ] Phase 3 — Graph delta sync
+- [x] Phase 3 — Graph delta sync
 - [ ] Phase 4 — read UI (offline-capable list + message view)
 - [ ] Phase 5 — compose + send
 - [ ] Phase 6 — local full-text search (FTS5)
