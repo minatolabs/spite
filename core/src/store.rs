@@ -78,6 +78,8 @@ pub trait MailStore: Send + Sync {
         offset: u32,
     ) -> Result<Vec<MessageSummary>, MailStoreError>;
     fn get_message(&self, id: &str) -> Result<Option<Message>, MailStoreError>;
+    /// Deleting a nonexistent id is a no-op (delta rounds may replay).
+    fn delete_message(&self, id: &str) -> Result<(), MailStoreError>;
     fn get_sync_state(&self, folder_id: &str) -> Result<Option<SyncState>, MailStoreError>;
     fn set_sync_state(&self, state: &SyncState) -> Result<(), MailStoreError>;
 }
@@ -293,6 +295,12 @@ impl MailStore for SqliteMailStore {
         Ok(message)
     }
 
+    fn delete_message(&self, id: &str) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     fn get_sync_state(&self, folder_id: &str) -> Result<Option<SyncState>, MailStoreError> {
         let conn = self.conn.lock().unwrap();
         let state = conn
@@ -386,6 +394,11 @@ impl MailStore for MemoryMailStore {
 
     fn get_message(&self, id: &str) -> Result<Option<Message>, MailStoreError> {
         Ok(self.messages.lock().unwrap().get(id).cloned())
+    }
+
+    fn delete_message(&self, id: &str) -> Result<(), MailStoreError> {
+        self.messages.lock().unwrap().remove(id);
+        Ok(())
     }
 
     fn get_sync_state(&self, folder_id: &str) -> Result<Option<SyncState>, MailStoreError> {
@@ -482,6 +495,15 @@ mod tests {
             Some("<p>old</p>"),
             "summary-only upsert must not clear the body"
         );
+
+        // Deletion: removes the row; deleting again (or a missing id) is a no-op.
+        store
+            .upsert_messages(&[message("gone", "f1", 50, None)])
+            .unwrap();
+        store.delete_message("gone").unwrap();
+        assert!(store.get_message("gone").unwrap().is_none());
+        store.delete_message("gone").unwrap();
+        store.delete_message("never-existed").unwrap();
 
         // Sync state round-trip and update.
         assert!(store.get_sync_state("f1").unwrap().is_none());

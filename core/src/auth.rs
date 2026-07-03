@@ -172,6 +172,13 @@ impl Authenticator {
             .ok_or(AuthError::NeedsSignIn)
     }
 
+    /// Drop the cached access token so the next `access_token()` call
+    /// refreshes. Used when Graph rejects a token (401) that our local
+    /// expiry bookkeeping still considered valid.
+    pub async fn invalidate_session(&self) {
+        *self.session.lock().await = None;
+    }
+
     pub async fn sign_out(&self) -> Result<(), AuthError> {
         if let Some(account) = self.read_state()? {
             self.delete_refresh_token(&account.upn).await?;

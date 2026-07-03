@@ -53,7 +53,10 @@ Entra app registration:
   // optional; where the local mail database lives.
   // Defaults to the platform app-data dir, e.g.
   // ~/.local/share/com.minatolabs.spite/spite.db on Linux.
-  "db_path": "/path/to/spite.db"
+  "db_path": "/path/to/spite.db",
+  // optional; how many recent Inbox messages the first sync backfills.
+  // Defaults to 200, clamped to 1..=1000.
+  "backfill_count": 200
 }
 ```
 
