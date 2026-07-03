@@ -2,7 +2,7 @@
 //! so users can bring their own app registration (or point authority at a
 //! single tenant for testing) without a code change.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,8 @@ pub const CONFIG_FILE: &str = "config.json";
 pub struct AppConfig {
     pub client_id: String,
     pub authority: String,
+    /// Mail database location; `None` means the platform app-data dir.
+    pub db_path: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -24,6 +26,7 @@ impl Default for AppConfig {
         Self {
             client_id: DEFAULT_CLIENT_ID.to_string(),
             authority: DEFAULT_AUTHORITY.to_string(),
+            db_path: None,
         }
     }
 }
@@ -33,6 +36,7 @@ impl Default for AppConfig {
 struct ConfigOverrides {
     client_id: Option<String>,
     authority: Option<String>,
+    db_path: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -48,6 +52,9 @@ impl AppConfig {
                     }
                     if let Some(v) = overrides.authority {
                         cfg.authority = v;
+                    }
+                    if let Some(v) = overrides.db_path {
+                        cfg.db_path = Some(v);
                     }
                 }
                 Err(e) => eprintln!("spite: ignoring malformed {}: {e}", path.display()),
@@ -91,5 +98,21 @@ mod tests {
             "unset fields keep defaults"
         );
         assert!(cfg.is_configured());
+    }
+
+    #[test]
+    fn db_path_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"{ "db_path": "/tmp/custom/spite.db" }"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load(dir.path());
+        assert_eq!(
+            cfg.db_path.as_deref(),
+            Some(Path::new("/tmp/custom/spite.db"))
+        );
+        assert_eq!(AppConfig::default().db_path, None);
     }
 }

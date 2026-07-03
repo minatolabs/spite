@@ -3,6 +3,7 @@ use std::sync::Arc;
 use spite_core::auth::token_store::KeyringTokenStore;
 use spite_core::auth::{Account, Authenticator, DeviceCodePrompt};
 use spite_core::config::AppConfig;
+use spite_core::store::{MailStore, SqliteMailStore};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
@@ -33,6 +34,14 @@ pub fn run() {
             std::fs::create_dir_all(&config_dir)?;
             std::fs::create_dir_all(&data_dir)?;
             let config = AppConfig::load(&config_dir);
+
+            let db_path = config
+                .db_path
+                .clone()
+                .unwrap_or_else(|| data_dir.join("spite.db"));
+            let mail_store: Arc<dyn MailStore> = Arc::new(SqliteMailStore::open(db_path)?);
+            app.manage(mail_store);
+
             let auth = Authenticator::new(config, Arc::new(KeyringTokenStore), data_dir);
             app.manage(auth);
             Ok(())

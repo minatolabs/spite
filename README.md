@@ -49,9 +49,16 @@ Entra app registration:
 {
   "client_id": "<your-application-client-id>",
   // optional; defaults to https://login.microsoftonline.com/common
-  "authority": "https://login.microsoftonline.com/organizations"
+  "authority": "https://login.microsoftonline.com/organizations",
+  // optional; where the local mail database lives.
+  // Defaults to the platform app-data dir, e.g.
+  // ~/.local/share/com.minatolabs.spite/spite.db on Linux.
+  "db_path": "/path/to/spite.db"
 }
 ```
+
+All fields are optional overrides — with no config file, Spite uses its
+defaults (and bring-your-own-client-id stays a plain config change).
 
 Sign-in uses the OAuth 2.0 device-code flow: the app shows a code and
 `microsoft.com/devicelogin`; complete sign-in in any browser. The refresh
