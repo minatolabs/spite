@@ -1,0 +1,332 @@
+/* ==========================================================================
+   Spite — design tokens
+   ==========================================================================
+   Skeuomorphic dark UI. Near-black chassis, oxblood accent, warm bone text.
+   Three layers:
+     1. Primitives  — raw values. Never referenced by components.
+     2. Semantic    — roles (surface, text, accent, state). Components use these.
+     3. Component   — per-widget recipes built from semantic tokens.
+   Import once in the Svelte root (e.g. app.css or +layout.svelte).
+   ========================================================================== */
+
+:root {
+  /* ------------------------------------------------------------------
+     1. PRIMITIVES
+     ------------------------------------------------------------------ */
+
+  /* Ink — near-blacks, warm-shifted (brown undertone, never blue) */
+  --ink-950: #0a0807;   /* deepest wells */
+  --ink-900: #0d0b0a;   /* recessed panels, message list */
+  --ink-850: #100d0c;   /* chassis / window body */
+  --ink-800: #141110;   /* reading pane */
+  --ink-750: #171312;
+  --ink-700: #1a1514;   /* raised chrome, low */
+  --ink-650: #1d1816;   /* raised chrome, mid */
+  --ink-600: #241f1d;   /* raised chrome, high (titlebar top) */
+  --ink-500: #2a2422;   /* bevel button top */
+  --ink-400: #3a332f;   /* inert controls */
+
+  /* Oxblood — the accent ramp. 300 is the hot edge. */
+  --ox-900: #24070a;
+  --ox-800: #2a080b;
+  --ox-700: #3d0e12;
+  --ox-600: #4a1116;
+  --ox-500: #5c181d;
+  --ox-400: #7c232b;
+  --ox-300: #8a2b31;   /* LEDs, selection edge, glow source */
+  --ox-200: #c98a7e;   /* desaturated tint for labels on dark */
+  --ox-100: #f0dcd7;   /* text on oxblood fills */
+  --ox-hot: #e05a63;   /* LED specular highlight only */
+
+  /* Bone — warm off-white text ramp */
+  --bone-100: #efe4d8;  /* headings, subjects */
+  --bone-200: #e8ddd2;  /* primary UI text */
+  --bone-300: #d9cfc4;  /* control labels */
+  --bone-400: #cfc2b5;  /* serif body text */
+  --bone-500: #b6a99d;  /* secondary */
+  --bone-600: #8a7c70;  /* tertiary, timestamps */
+  --bone-700: #7a6e63;  /* muted, counts */
+  --bone-800: #6f635a;  /* placeholders, disabled */
+
+  /* Brass — minor accent. Flags, stars, VIP. Nothing else. */
+  --brass-400: #b08a4a;
+  --brass-300: #c9a55e;
+
+  /* Ember — destructive/error. Brighter than oxblood so it still reads
+     as "danger" on a UI where oxblood means "primary". */
+  --ember-400: #c73e46;
+  --ember-300: #de5d63;
+
+  /* Verdigris — success/online. Oxidized copper, stays in the material world. */
+  --verd-400: #3f7d64;
+  --verd-300: #57997c;
+
+  /* Light-catch and shadow washes for skeuo effects */
+  --catch-strong: rgba(255, 255, 255, 0.18);
+  --catch:        rgba(255, 255, 255, 0.09);
+  --catch-faint:  rgba(255, 255, 255, 0.04);
+  --pit:          rgba(0, 0, 0, 0.60);
+  --pit-deep:     rgba(0, 0, 0, 0.75);
+
+  /* ------------------------------------------------------------------
+     2. SEMANTIC
+     ------------------------------------------------------------------ */
+
+  /* Surfaces */
+  --sp-surface-well:    var(--ink-950);  /* inputs, search, recessed areas */
+  --sp-surface-sunken:  var(--ink-900);  /* message list, sidebars */
+  --sp-surface-base:    var(--ink-850);  /* window chassis */
+  --sp-surface-raised:  var(--ink-800);  /* reading pane, cards */
+  --sp-surface-chrome:  linear-gradient(180deg, var(--ink-650), var(--ink-750)); /* toolbars */
+  --sp-surface-titlebar: linear-gradient(180deg, var(--ink-600), var(--ink-750));
+
+  /* Text */
+  --sp-text-display:    var(--bone-100);
+  --sp-text-primary:    var(--bone-200);
+  --sp-text-body:       var(--bone-400);  /* serif message bodies */
+  --sp-text-secondary:  var(--bone-500);
+  --sp-text-tertiary:   var(--bone-600);
+  --sp-text-muted:      var(--bone-700);
+  --sp-text-placeholder: var(--bone-800);
+  --sp-text-on-accent:  var(--ox-100);
+  --sp-text-accent:     var(--ox-200);
+
+  /* Accent */
+  --sp-accent:          var(--ox-400);
+  --sp-accent-edge:     var(--ox-300);
+  --sp-accent-deep:     var(--ox-600);
+  --sp-accent-fill:     linear-gradient(180deg, var(--ox-400), var(--ox-600));
+  --sp-accent-fill-hover: linear-gradient(180deg, #8d2831, var(--ox-500));
+  --sp-accent-fill-active: linear-gradient(180deg, var(--ox-600), var(--ox-500));
+  --sp-selected-fill:   linear-gradient(180deg, #231413, #170e0d);
+
+  /* Status */
+  --sp-danger:          var(--ember-400);
+  --sp-danger-hover:    var(--ember-300);
+  --sp-success:         var(--verd-300);
+  --sp-flag:            var(--brass-300);
+
+  /* Borders and stitching */
+  --sp-border-hard:     #000000;                        /* panel seams */
+  --sp-border-control:  #050403;                        /* button outlines */
+  --sp-border-accent:   var(--ox-900);
+  --sp-stitch:          1px dashed rgba(232, 224, 216, 0.14);
+  --sp-stitch-strong:   1px dashed rgba(232, 224, 216, 0.22);
+
+  /* Skeuo shadow recipes */
+  --sp-bevel:           inset 0 1px 0 var(--catch), 0 1px 2px var(--pit);
+  --sp-bevel-accent:    inset 0 1px 0 var(--catch-strong),
+                        inset 0 -1px 0 rgba(0, 0, 0, 0.4),
+                        0 1px 3px var(--pit);
+  --sp-bevel-pressed:   inset 0 2px 3px var(--pit), inset 0 -1px 0 var(--catch-faint);
+  --sp-well:            inset 0 2px 5px var(--pit-deep), inset 0 -1px 0 var(--catch-faint);
+  --sp-seam-right:      inset -1px 0 0 var(--catch-faint);
+  --sp-seam-top:        inset 0 1px 0 var(--catch-faint);
+  --sp-lift:            0 12px 30px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --sp-glow-unread:     0 0 6px rgba(200, 60, 70, 0.7), inset 0 1px 1px rgba(255, 255, 255, 0.35);
+  --sp-focus-ring:      0 0 0 1px var(--ox-300), 0 0 0 3px rgba(138, 43, 49, 0.35);
+
+  /* Typography */
+  --sp-font-ui:    -apple-system, "Segoe UI", "Noto Sans", "Ubuntu", "Cantarell",
+                   "Helvetica Neue", sans-serif;
+  --sp-font-serif: "Iowan Old Style", "Charter", "Bitstream Charter",
+                   "Source Serif 4", Georgia, serif;
+  --sp-font-mono:  "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code",
+                   ui-monospace, monospace;
+
+  --sp-fs-caption: 11px;
+  --sp-fs-small:   12px;
+  --sp-fs-body:    13px;
+  --sp-fs-md:      14px;
+  --sp-fs-subject: 16px;
+  --sp-fs-title:   18px;
+
+  --sp-lh-tight:   1.3;
+  --sp-lh-ui:      1.45;
+  --sp-lh-body:    1.7;   /* serif message bodies */
+
+  --sp-track-wordmark: 3px;
+  --sp-track-label:    1px;  /* small-cap section labels like FOLDERS */
+
+  /* Spacing — 4px grid */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* Radii */
+  --sp-r-control: 6px;
+  --sp-r-panel:   10px;
+  --sp-r-pill:    999px;
+
+  /* Motion */
+  --sp-dur-fast: 90ms;
+  --sp-dur-base: 160ms;
+  --sp-dur-slow: 280ms;
+  --sp-ease:     cubic-bezier(0.2, 0, 0.2, 1);
+  --sp-ease-out: cubic-bezier(0, 0, 0.2, 1);
+
+  /* Z-index scale */
+  --sp-z-dropdown: 100;
+  --sp-z-toast:    200;
+  --sp-z-modal:    300;
+
+  /* Layout */
+  --sp-w-folders: 200px;
+  --sp-w-list:    320px;
+  --sp-h-toolbar: 48px;
+  --sp-h-titlebar: 36px;
+  --sp-h-statusbar: 26px;
+}
+
+/* ------------------------------------------------------------------
+   Parchment theme stub — light "reading room" mode. Same semantic
+   contract, flipped materials: paper instead of leather. Fill in when
+   the theme phase lands; components need zero changes.
+   ------------------------------------------------------------------ */
+[data-theme="parchment"] {
+  --sp-surface-well:    #e4dccd;
+  --sp-surface-sunken:  #ece5d8;
+  --sp-surface-base:    #f2ecdf;
+  --sp-surface-raised:  #f7f2e7;
+  --sp-surface-chrome:  linear-gradient(180deg, #efe8da, #e2dac9);
+  --sp-surface-titlebar: linear-gradient(180deg, #f2ecdf, #e2dac9);
+  --sp-text-display:    #2a1d1a;
+  --sp-text-primary:    #33251f;
+  --sp-text-body:       #40302a;
+  --sp-text-secondary:  #6b5a50;
+  --sp-text-tertiary:   #85736a;
+  --sp-text-muted:      #97867c;
+  --sp-text-placeholder: #a4948a;
+  --sp-border-hard:     #b9ac97;
+  --sp-border-control:  #a3947e;
+  --sp-stitch:          1px dashed rgba(61, 40, 33, 0.22);
+  --sp-catch: rgba(255, 255, 255, 0.7);
+  --sp-bevel: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 1px 2px rgba(90, 70, 50, 0.35);
+  --sp-well:  inset 0 2px 4px rgba(90, 70, 50, 0.30), inset 0 -1px 0 rgba(255, 255, 255, 0.6);
+  /* Oxblood ramp stays as-is: it reads even better on parchment. */
+}
+
+/* ==========================================================================
+   3. COMPONENT RECIPES
+   Optional utility layer. Svelte components can apply these classes or
+   copy the declarations into scoped styles. All values route through
+   semantic tokens above.
+   ========================================================================== */
+
+.sp-btn {
+  font: 500 var(--sp-fs-small) / var(--sp-lh-tight) var(--sp-font-ui);
+  color: var(--bone-300);
+  background: linear-gradient(180deg, var(--ink-500), var(--ink-700));
+  border: 1px solid var(--sp-border-control);
+  border-radius: var(--sp-r-control);
+  box-shadow: var(--sp-bevel);
+  padding: 6px var(--sp-3);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: filter var(--sp-dur-fast) var(--sp-ease);
+}
+.sp-btn:hover  { filter: brightness(1.12); }
+.sp-btn:active { box-shadow: var(--sp-bevel-pressed); transform: translateY(1px); }
+.sp-btn:focus-visible { outline: none; box-shadow: var(--sp-focus-ring); }
+
+.sp-btn--primary {
+  color: var(--sp-text-on-accent);
+  background: var(--sp-accent-fill);
+  border-color: var(--sp-border-accent);
+  box-shadow: var(--sp-bevel-accent);
+}
+.sp-btn--primary:hover  { background: var(--sp-accent-fill-hover); filter: none; }
+.sp-btn--primary:active { background: var(--sp-accent-fill-active); }
+
+.sp-btn--danger { color: var(--sp-danger-hover); }
+
+.sp-field {
+  font: 400 var(--sp-fs-small) / var(--sp-lh-ui) var(--sp-font-ui);
+  color: var(--sp-text-primary);
+  background: var(--sp-surface-well);
+  border: 1px solid var(--sp-border-hard);
+  border-radius: var(--sp-r-control);
+  box-shadow: var(--sp-well);
+  padding: 7px var(--sp-3);
+}
+.sp-field::placeholder { color: var(--sp-text-placeholder); }
+.sp-field:focus-visible { outline: none; box-shadow: var(--sp-well), var(--sp-focus-ring); }
+
+.sp-led {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--sp-r-pill);
+  background: radial-gradient(circle at 35% 30%, var(--ox-hot), var(--ox-300) 60%, var(--ox-600));
+  box-shadow: var(--sp-glow-unread);
+  flex: none;
+}
+.sp-led--off {
+  background: radial-gradient(circle at 35% 30%, var(--ink-400), var(--ink-700));
+  box-shadow: none;
+}
+.sp-led--online {
+  background: radial-gradient(circle at 35% 30%, var(--verd-300), var(--verd-400) 60%, #244838);
+  box-shadow: 0 0 6px rgba(87, 153, 124, 0.6), inset 0 1px 1px rgba(255, 255, 255, 0.3);
+}
+
+.sp-stitch-h { border-top: var(--sp-stitch); }
+.sp-stitch-v { border-left: var(--sp-stitch); }
+
+.sp-list-item {
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid #060505;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  cursor: default;
+}
+.sp-list-item:hover { background: var(--ink-800); }
+.sp-list-item--selected {
+  background: var(--sp-selected-fill);
+  border-left: 3px solid var(--sp-accent-edge);
+}
+
+.sp-badge {
+  font: 500 var(--sp-fs-caption) / 1 var(--sp-font-ui);
+  color: var(--sp-text-accent);
+  background: rgba(138, 43, 49, 0.18);
+  border: 1px solid rgba(138, 43, 49, 0.5);
+  border-radius: 5px;
+  padding: 2px var(--sp-2);
+}
+
+.sp-count {
+  font: 400 var(--sp-fs-caption) / 1 var(--sp-font-ui);
+  background: var(--ox-800);
+  color: var(--ox-100);
+  border-radius: var(--sp-r-pill);
+  padding: 2px 7px;
+  box-shadow: inset 0 1px 2px var(--pit);
+}
+
+.sp-body-serif {
+  font: 400 var(--sp-fs-body) / var(--sp-lh-body) var(--sp-font-serif);
+  color: var(--sp-text-body);
+}
+
+/* Scrollbars — recessed track, beveled thumb */
+.sp-scroll::-webkit-scrollbar { width: 10px; }
+.sp-scroll::-webkit-scrollbar-track {
+  background: var(--sp-surface-well);
+  box-shadow: inset 1px 0 2px var(--pit);
+}
+.sp-scroll::-webkit-scrollbar-thumb {
+  background: linear-gradient(90deg, var(--ink-500), var(--ink-700));
+  border: 1px solid var(--sp-border-control);
+  border-radius: var(--sp-r-pill);
+  box-shadow: inset 0 1px 0 var(--catch-faint);
+}
+.sp-scroll::-webkit-scrollbar-thumb:hover { filter: brightness(1.15); }
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --sp-dur-fast: 0ms; --sp-dur-base: 0ms; --sp-dur-slow: 0ms; }
+}

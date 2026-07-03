@@ -1,18 +1,24 @@
-:root {
-  font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
-  color-scheme: light dark;
-  color: #1a1a1a;
-  background: #ffffff;
-  -webkit-font-smoothing: antialiased;
+/* Base reset; all values route through tokens.css (imported first). */
+
+* {
+  box-sizing: border-box;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #e5e5e5;
-    background: #16171d;
-  }
+:root {
+  font-family: var(--sp-font-ui);
+  font-size: var(--sp-fs-body);
+  line-height: var(--sp-lh-ui);
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
 }
 
 body {
   margin: 0;
+  background: var(--sp-surface-base);
+  color: var(--sp-text-primary);
+  overflow: hidden;
+}
+
+#app {
+  height: 100svh;
 }

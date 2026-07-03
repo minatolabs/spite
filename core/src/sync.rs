@@ -1,4 +1,4 @@
-//! Graph delta sync orchestration (Inbox-only for v0.1).
+//! Graph delta sync orchestration (per-folder).
 //!
 //! The algorithm runs against the `MailSource` trait so it is fully
 //! unit-testable with `MockMailSource` — the same seam pattern as
@@ -76,7 +76,6 @@ pub struct DeltaPage {
 
 /// The fetch surface sync depends on.
 pub trait MailSource: Send + Sync {
-    fn get_inbox_folder(&self) -> impl Future<Output = Result<Folder, SourceError>> + Send;
     /// Timestamp of the Nth-most-recent message (the backfill window edge);
     /// "now" for an empty folder.
     fn backfill_cutoff(
@@ -106,14 +105,15 @@ pub(crate) fn now_epoch() -> i64 {
         .as_secs() as i64
 }
 
-/// Run one sync round for the Inbox: initial backfill-plus-baseline when no
-/// cursor is stored, incremental delta otherwise.
-pub async fn sync_inbox(
+/// Run one sync round for a folder: initial backfill-plus-baseline when no
+/// cursor is stored, incremental delta otherwise. The folder row is
+/// (re-)upserted first so the messages FK always resolves.
+pub async fn sync_folder(
     source: &impl MailSource,
     store: Arc<dyn MailStore>,
+    folder: &Folder,
     backfill_count: u32,
 ) -> Result<SyncReport, SyncError> {
-    let folder = with_throttle_retry(|| source.get_inbox_folder()).await?;
     let folder_id = folder.id.clone();
     {
         let folder = folder.clone();
@@ -239,8 +239,16 @@ mod tests {
     use super::*;
     use crate::store::{MemoryMailStore, MessageSummary};
 
+    fn inbox() -> Folder {
+        Folder {
+            id: "inbox-id".into(),
+            display_name: "Inbox".into(),
+            well_known_name: Some("inbox".into()),
+            parent_id: None,
+        }
+    }
+
     struct MockMailSource {
-        folder: Folder,
         cutoff: i64,
         pages: Mutex<VecDeque<Result<DeltaPage, SourceError>>>,
         requests: Mutex<Vec<DeltaRequest>>,
@@ -249,12 +257,6 @@ mod tests {
     impl MockMailSource {
         fn new(pages: Vec<Result<DeltaPage, SourceError>>) -> Self {
             Self {
-                folder: Folder {
-                    id: "inbox-id".into(),
-                    display_name: "Inbox".into(),
-                    well_known_name: Some("inbox".into()),
-                    parent_id: None,
-                },
                 cutoff: 1_000,
                 pages: Mutex::new(pages.into()),
                 requests: Mutex::new(Vec::new()),
@@ -267,10 +269,6 @@ mod tests {
     }
 
     impl MailSource for MockMailSource {
-        async fn get_inbox_folder(&self) -> Result<Folder, SourceError> {
-            Ok(self.folder.clone())
-        }
-
         async fn backfill_cutoff(&self, _folder_id: &str, _n: u32) -> Result<i64, SourceError> {
             Ok(self.cutoff)
         }
@@ -300,6 +298,7 @@ mod tests {
             },
             conversation_id: None,
             body_html: None,
+            body_content_type: None,
         }
     }
 
@@ -327,7 +326,9 @@ mod tests {
         ]);
         let store: Arc<dyn MailStore> = Arc::new(MemoryMailStore::default());
 
-        let report = sync_inbox(&source, Arc::clone(&store), 200).await.unwrap();
+        let report = sync_folder(&source, Arc::clone(&store), &inbox(), 200)
+            .await
+            .unwrap();
 
         assert!(report.initial);
         assert_eq!(report.pages, 2);
@@ -391,7 +392,9 @@ mod tests {
             PageToken::Delta("https://graph/delta-2".into()),
         ))]);
 
-        let report = sync_inbox(&source, Arc::clone(&store), 200).await.unwrap();
+        let report = sync_folder(&source, Arc::clone(&store), &inbox(), 200)
+            .await
+            .unwrap();
 
         assert!(!report.initial);
         assert_eq!(report.upserted, 1);
@@ -427,7 +430,9 @@ mod tests {
         ]);
         let store: Arc<dyn MailStore> = Arc::new(MemoryMailStore::default());
 
-        let report = sync_inbox(&source, Arc::clone(&store), 200).await.unwrap();
+        let report = sync_folder(&source, Arc::clone(&store), &inbox(), 200)
+            .await
+            .unwrap();
         assert_eq!(report.upserted, 1);
 
         // Same request sent twice: throttled, then retried.
@@ -448,7 +453,7 @@ mod tests {
         ]);
         let store: Arc<dyn MailStore> = Arc::new(MemoryMailStore::default());
 
-        let err = sync_inbox(&source, Arc::clone(&store), 200)
+        let err = sync_folder(&source, Arc::clone(&store), &inbox(), 200)
             .await
             .unwrap_err();
         assert!(matches!(err, SyncError::Source(SourceError::Http(_))));

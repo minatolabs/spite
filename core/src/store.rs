@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use rusqlite_migration::{Migrations, M};
+use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MailStoreError {
@@ -20,7 +21,7 @@ pub enum MailStoreError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Folder {
     pub id: String,
     pub display_name: String,
@@ -29,7 +30,7 @@ pub struct Folder {
 }
 
 /// The cheap projection for list views — everything but the body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageSummary {
     pub id: String,
     pub folder_id: String,
@@ -43,15 +44,19 @@ pub struct MessageSummary {
     pub has_attachments: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Message {
     pub summary: MessageSummary,
     /// Stored for forward compatibility; unused until threading.
     pub conversation_id: Option<String>,
+    /// ALWAYS sanitized before storage (see `crate::sanitize`) — raw
+    /// message HTML never lands in the database.
     pub body_html: Option<String>,
+    /// "html" or "text"; `None` until the body has been fetched.
+    pub body_content_type: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SyncState {
     pub folder_id: String,
     /// Graph delta cursor (populated in Phase 3).
@@ -80,13 +85,30 @@ pub trait MailStore: Send + Sync {
     fn get_message(&self, id: &str) -> Result<Option<Message>, MailStoreError>;
     /// Deleting a nonexistent id is a no-op (delta rounds may replay).
     fn delete_message(&self, id: &str) -> Result<(), MailStoreError>;
+    /// Cache a lazily-fetched (and already-sanitized) body.
+    fn set_message_body(
+        &self,
+        id: &str,
+        body: &str,
+        content_type: &str,
+    ) -> Result<(), MailStoreError>;
+    /// Unread message count per folder id.
+    fn unread_counts(&self) -> Result<Vec<(String, u32)>, MailStoreError>;
+    /// Whether remote images are allowed for this sender (default false).
+    fn get_sender_pref(&self, address: &str) -> Result<bool, MailStoreError>;
+    fn set_sender_pref(
+        &self,
+        address: &str,
+        allow_remote_images: bool,
+    ) -> Result<(), MailStoreError>;
     fn get_sync_state(&self, folder_id: &str) -> Result<Option<SyncState>, MailStoreError>;
     fn set_sync_state(&self, state: &SyncState) -> Result<(), MailStoreError>;
 }
 
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(
-        "CREATE TABLE folders (
+    Migrations::new(vec![
+        M::up(
+            "CREATE TABLE folders (
             id              TEXT PRIMARY KEY,
             display_name    TEXT NOT NULL,
             well_known_name TEXT,
@@ -112,7 +134,16 @@ fn migrations() -> Migrations<'static> {
             delta_link     TEXT,
             last_synced_at INTEGER
         );",
-    )])
+        ),
+        // v2 (Phase 4): lazy-loaded body metadata + per-sender image prefs.
+        M::up(
+            "ALTER TABLE messages ADD COLUMN body_content_type TEXT;
+        CREATE TABLE sender_prefs (
+            address             TEXT PRIMARY KEY,
+            allow_remote_images INTEGER NOT NULL DEFAULT 0
+        );",
+        ),
+    ])
 }
 
 pub struct SqliteMailStore {
@@ -219,8 +250,8 @@ impl MailStore for SqliteMailStore {
             let mut stmt = tx.prepare(
                 "INSERT INTO messages (id, folder_id, conversation_id, subject, from_name,
                                        from_address, received_at, preview, is_read,
-                                       has_attachments, body_html)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                       has_attachments, body_html, body_content_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(id) DO UPDATE SET
                      folder_id       = excluded.folder_id,
                      conversation_id = excluded.conversation_id,
@@ -231,7 +262,9 @@ impl MailStore for SqliteMailStore {
                      preview         = excluded.preview,
                      is_read         = excluded.is_read,
                      has_attachments = excluded.has_attachments,
-                     body_html       = COALESCE(excluded.body_html, messages.body_html)",
+                     body_html       = COALESCE(excluded.body_html, messages.body_html),
+                     body_content_type =
+                         COALESCE(excluded.body_content_type, messages.body_content_type)",
             )?;
             for m in messages {
                 let s = &m.summary;
@@ -247,6 +280,7 @@ impl MailStore for SqliteMailStore {
                     s.is_read,
                     s.has_attachments,
                     m.body_html,
+                    m.body_content_type,
                 ])?;
             }
         }
@@ -280,7 +314,8 @@ impl MailStore for SqliteMailStore {
         let message = conn
             .query_row(
                 "SELECT id, folder_id, subject, from_name, from_address, received_at,
-                        preview, is_read, has_attachments, conversation_id, body_html
+                        preview, is_read, has_attachments, conversation_id, body_html,
+                        body_content_type
                  FROM messages WHERE id = ?1",
                 params![id],
                 |row| {
@@ -288,6 +323,7 @@ impl MailStore for SqliteMailStore {
                         summary: Self::summary_from_row(row)?,
                         conversation_id: row.get("conversation_id")?,
                         body_html: row.get("body_html")?,
+                        body_content_type: row.get("body_content_type")?,
                     })
                 },
             )
@@ -298,6 +334,57 @@ impl MailStore for SqliteMailStore {
     fn delete_message(&self, id: &str) -> Result<(), MailStoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    fn set_message_body(
+        &self,
+        id: &str,
+        body: &str,
+        content_type: &str,
+    ) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET body_html = ?2, body_content_type = ?3 WHERE id = ?1",
+            params![id, body, content_type],
+        )?;
+        Ok(())
+    }
+
+    fn unread_counts(&self) -> Result<Vec<(String, u32)>, MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT folder_id, COUNT(*) FROM messages WHERE is_read = 0 GROUP BY folder_id",
+        )?;
+        let counts = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(counts)
+    }
+
+    fn get_sender_pref(&self, address: &str) -> Result<bool, MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let allow: Option<bool> = conn
+            .query_row(
+                "SELECT allow_remote_images FROM sender_prefs WHERE address = ?1",
+                params![address],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(allow.unwrap_or(false))
+    }
+
+    fn set_sender_pref(
+        &self,
+        address: &str,
+        allow_remote_images: bool,
+    ) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sender_prefs (address, allow_remote_images) VALUES (?1, ?2)
+             ON CONFLICT(address) DO UPDATE SET allow_remote_images = excluded.allow_remote_images",
+            params![address, allow_remote_images],
+        )?;
         Ok(())
     }
 
@@ -340,6 +427,7 @@ pub struct MemoryMailStore {
     folders: Mutex<HashMap<String, Folder>>,
     messages: Mutex<HashMap<String, Message>>,
     sync_state: Mutex<HashMap<String, SyncState>>,
+    sender_prefs: Mutex<HashMap<String, bool>>,
 }
 
 impl MailStore for MemoryMailStore {
@@ -362,9 +450,12 @@ impl MailStore for MemoryMailStore {
         let mut map = self.messages.lock().unwrap();
         for m in messages {
             let mut m = m.clone();
-            if m.body_html.is_none() {
-                if let Some(existing) = map.get(&m.summary.id) {
+            if let Some(existing) = map.get(&m.summary.id) {
+                if m.body_html.is_none() {
                     m.body_html = existing.body_html.clone();
+                }
+                if m.body_content_type.is_none() {
+                    m.body_content_type = existing.body_content_type.clone();
                 }
             }
             map.insert(m.summary.id.clone(), m);
@@ -398,6 +489,52 @@ impl MailStore for MemoryMailStore {
 
     fn delete_message(&self, id: &str) -> Result<(), MailStoreError> {
         self.messages.lock().unwrap().remove(id);
+        Ok(())
+    }
+
+    fn set_message_body(
+        &self,
+        id: &str,
+        body: &str,
+        content_type: &str,
+    ) -> Result<(), MailStoreError> {
+        if let Some(m) = self.messages.lock().unwrap().get_mut(id) {
+            m.body_html = Some(body.to_string());
+            m.body_content_type = Some(content_type.to_string());
+        }
+        Ok(())
+    }
+
+    fn unread_counts(&self) -> Result<Vec<(String, u32)>, MailStoreError> {
+        let map = self.messages.lock().unwrap();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        for m in map.values().filter(|m| !m.summary.is_read) {
+            *counts.entry(m.summary.folder_id.clone()).or_default() += 1;
+        }
+        let mut counts: Vec<_> = counts.into_iter().collect();
+        counts.sort();
+        Ok(counts)
+    }
+
+    fn get_sender_pref(&self, address: &str) -> Result<bool, MailStoreError> {
+        Ok(self
+            .sender_prefs
+            .lock()
+            .unwrap()
+            .get(address)
+            .copied()
+            .unwrap_or(false))
+    }
+
+    fn set_sender_pref(
+        &self,
+        address: &str,
+        allow_remote_images: bool,
+    ) -> Result<(), MailStoreError> {
+        self.sender_prefs
+            .lock()
+            .unwrap()
+            .insert(address.to_string(), allow_remote_images);
         Ok(())
     }
 
@@ -442,6 +579,7 @@ mod tests {
             },
             conversation_id: None,
             body_html: body.map(str::to_string),
+            body_content_type: body.map(|_| "html".to_string()),
         }
     }
 
@@ -495,6 +633,29 @@ mod tests {
             Some("<p>old</p>"),
             "summary-only upsert must not clear the body"
         );
+
+        // Lazy body caching: set_message_body fills body + content type;
+        // a later summary-only upsert must preserve both.
+        store
+            .set_message_body("m2", "<p>fetched</p>", "html")
+            .unwrap();
+        store
+            .upsert_messages(&[message("m2", "f1", 300, None)])
+            .unwrap();
+        let m2 = store.get_message("m2").unwrap().unwrap();
+        assert_eq!(m2.body_html.as_deref(), Some("<p>fetched</p>"));
+        assert_eq!(m2.body_content_type.as_deref(), Some("html"));
+
+        // Unread counts per folder (m1 was marked read above).
+        let counts = store.unread_counts().unwrap();
+        assert_eq!(counts, vec![("f1".to_string(), 2), ("f2".to_string(), 1)]);
+
+        // Sender prefs: default false; set + overwrite round-trips.
+        assert!(!store.get_sender_pref("a@example.com").unwrap());
+        store.set_sender_pref("a@example.com", true).unwrap();
+        assert!(store.get_sender_pref("a@example.com").unwrap());
+        store.set_sender_pref("a@example.com", false).unwrap();
+        assert!(!store.get_sender_pref("a@example.com").unwrap());
 
         // Deletion: removes the row; deleting again (or a missing id) is a no-op.
         store
@@ -550,7 +711,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
@@ -558,9 +719,14 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        for required in ["folders", "messages", "sync_state"] {
+        for required in ["folders", "messages", "sync_state", "sender_prefs"] {
             assert!(tables.iter().any(|t| t == required), "missing {required}");
         }
+    }
+
+    #[test]
+    fn migrations_are_valid() {
+        assert!(migrations().validate().is_ok());
     }
 
     #[test]

@@ -181,6 +181,35 @@ struct ListResponse {
     value: Vec<GraphMessage>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FolderListResponse {
+    value: Vec<GraphFolder>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphBody {
+    content_type: Option<String>,
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphMessageWithBody {
+    body: Option<GraphBody>,
+    unique_body: Option<GraphBody>,
+}
+
+/// A lazily-fetched message body. `content` is RAW Graph output — callers
+/// must run HTML through `crate::sanitize::sanitize_html` before storing
+/// or rendering it.
+#[derive(Debug)]
+pub struct FetchedBody {
+    pub content: String,
+    /// "html" or "text".
+    pub content_type: String,
+}
+
 fn parse_epoch(rfc3339: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(rfc3339)
         .ok()
@@ -217,7 +246,8 @@ fn to_domain(g: GraphMessage) -> Message {
             has_attachments: g.has_attachments.unwrap_or(false),
         },
         conversation_id: g.conversation_id,
-        body_html: None, // never fetched during sync; lazy-loaded in Phase 4
+        body_html: None, // never fetched during sync; lazy-loaded on open
+        body_content_type: None,
     }
 }
 
@@ -234,25 +264,95 @@ fn split_delta(items: Vec<GraphMessage>) -> (Vec<Message>, Vec<String>) {
     (messages, removed)
 }
 
-impl MailSource for GraphMailSource {
-    async fn get_inbox_folder(&self) -> Result<Folder, SourceError> {
-        let f: GraphFolder = self
+/// Well-known folder aliases, in the pinned display order the UI uses.
+pub const WELL_KNOWN_FOLDERS: [&str; 6] = [
+    "inbox",
+    "sentitems",
+    "drafts",
+    "archive",
+    "junkemail",
+    "deleteditems",
+];
+
+impl GraphMailSource {
+    /// All mail folders: the well-known set resolved via their aliases
+    /// (v1.0's mailFolder has no wellKnownName property, so addressing each
+    /// alias is how we learn which id is which), plus the user's top-level
+    /// folders. An alias missing from the mailbox (404) is skipped.
+    pub async fn list_all_folders(&self) -> Result<Vec<Folder>, SourceError> {
+        let select = ("$select", "id,displayName,parentFolderId".to_string());
+        let mut folders = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for alias in WELL_KNOWN_FOLDERS {
+            let fetched: Result<GraphFolder, SourceError> = self
+                .get_json(
+                    &format!("{GRAPH_BASE}/me/mailFolders/{alias}"),
+                    std::slice::from_ref(&select),
+                    None,
+                )
+                .await;
+            match fetched {
+                Ok(f) => {
+                    seen.insert(f.id.clone());
+                    folders.push(Folder {
+                        id: f.id,
+                        display_name: f.display_name.unwrap_or_else(|| alias.to_string()),
+                        well_known_name: Some(alias.to_string()),
+                        parent_id: f.parent_folder_id,
+                    });
+                }
+                Err(SourceError::Http(msg)) if msg.starts_with("404") => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        let resp: FolderListResponse = self
             .get_json(
-                &format!("{GRAPH_BASE}/me/mailFolders/inbox"),
-                &[("$select", "id,displayName,parentFolderId".to_string())],
+                &format!("{GRAPH_BASE}/me/mailFolders"),
+                &[("$top", "100".to_string()), select],
                 None,
             )
             .await?;
-        Ok(Folder {
-            id: f.id,
-            display_name: f.display_name.unwrap_or_else(|| "Inbox".to_string()),
-            // v1.0 mailFolder has no wellKnownName property; we addressed the
-            // folder by its well-known alias, so set it ourselves.
-            well_known_name: Some("inbox".to_string()),
-            parent_id: f.parent_folder_id,
-        })
+        for f in resp.value {
+            if seen.insert(f.id.clone()) {
+                folders.push(Folder {
+                    id: f.id,
+                    display_name: f.display_name.unwrap_or_default(),
+                    well_known_name: None,
+                    parent_id: f.parent_folder_id,
+                });
+            }
+        }
+        Ok(folders)
     }
 
+    /// Lazy body fetch for a single message. Returns RAW content — the
+    /// caller sanitizes HTML before it goes anywhere.
+    pub async fn fetch_message_body(&self, id: &str) -> Result<FetchedBody, SourceError> {
+        let resp: GraphMessageWithBody = self
+            .get_json(
+                &format!("{GRAPH_BASE}/me/messages/{id}"),
+                &[("$select", "body,uniqueBody".to_string())],
+                None,
+            )
+            .await?;
+        let body = resp
+            .body
+            .or(resp.unique_body)
+            .ok_or_else(|| SourceError::Protocol("message has no body".to_string()))?;
+        let content_type = match body.content_type.as_deref() {
+            Some("html") => "html",
+            _ => "text",
+        };
+        Ok(FetchedBody {
+            content: body.content.unwrap_or_default(),
+            content_type: content_type.to_string(),
+        })
+    }
+}
+
+impl MailSource for GraphMailSource {
     async fn backfill_cutoff(&self, folder_id: &str, n: u32) -> Result<i64, SourceError> {
         let n = n.clamp(1, 1000);
         let resp: ListResponse = self
