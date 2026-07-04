@@ -7,7 +7,10 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
+use base64::Engine;
+
 use crate::auth::{AuthError, Authenticator};
+use crate::compose::{parse_references, EmailAddress, ReplyContext};
 use crate::store::{Folder, Message, MessageSummary};
 use crate::sync::{DeltaPage, DeltaRequest, MailSource, PageToken, SourceError};
 
@@ -187,6 +190,33 @@ struct FolderListResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct GraphHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphReplyContext {
+    internet_message_id: Option<String>,
+    internet_message_headers: Option<Vec<GraphHeader>>,
+    from: Option<GraphRecipient>,
+    reply_to: Option<Vec<GraphRecipient>>,
+    to_recipients: Option<Vec<GraphRecipient>>,
+    cc_recipients: Option<Vec<GraphRecipient>>,
+    subject: Option<String>,
+    received_date_time: Option<String>,
+}
+
+fn rec_to_email(r: GraphRecipient) -> Option<EmailAddress> {
+    let e = r.email_address?;
+    Some(EmailAddress {
+        name: e.name.unwrap_or_default(),
+        address: e.address.unwrap_or_default(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphBody {
     content_type: Option<String>,
@@ -325,6 +355,112 @@ impl GraphMailSource {
             }
         }
         Ok(folders)
+    }
+
+    /// Send a complete RFC 5322 message. Graph accepts base64-encoded MIME
+    /// on the same `sendMail` endpoint (Content-Type: text/plain) — the only
+    /// documented way to control In-Reply-To/References, since the JSON
+    /// payload restricts internetMessageHeaders to x-prefixed names.
+    /// Saves to Sent Items by default. Requires only `Mail.Send`.
+    pub async fn send_mime(&self, mime: &[u8]) -> Result<(), SourceError> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(mime);
+        for attempt in 0..2 {
+            let token = self.auth.access_token().await.map_err(|e| match e {
+                AuthError::NeedsSignIn | AuthError::NotConfigured => SourceError::Unauthorized,
+                other => SourceError::Http(other.to_string()),
+            })?;
+            let resp = self
+                .http
+                .post(format!("{GRAPH_BASE}/me/sendMail"))
+                .bearer_auth(token)
+                .header("Content-Type", "text/plain")
+                .body(encoded.clone())
+                .send()
+                .await
+                .map_err(|e| SourceError::Http(e.to_string()))?;
+
+            let status = resp.status().as_u16();
+            match status {
+                401 if attempt == 0 => {
+                    self.auth.invalidate_session().await;
+                    continue;
+                }
+                401 => return Err(SourceError::Unauthorized),
+                429 => {
+                    let retry_after = resp
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(5);
+                    return Err(SourceError::Throttled {
+                        retry_after: Duration::from_secs(retry_after),
+                    });
+                }
+                s if (200..300).contains(&s) => return Ok(()),
+                s => {
+                    return Err(SourceError::Http(format!(
+                        "{s}: {}",
+                        resp.text().await.unwrap_or_default()
+                    )));
+                }
+            }
+        }
+        unreachable!("the 401-retry loop always returns within two attempts")
+    }
+
+    /// Everything reply/forward construction needs from the original
+    /// message, including its internetMessageId and References chain.
+    /// `Mail.Read` — no new scope.
+    pub async fn fetch_reply_context(&self, id: &str) -> Result<ReplyContext, SourceError> {
+        let g: GraphReplyContext = self
+            .get_json(
+                &format!("{GRAPH_BASE}/me/messages/{id}"),
+                &[(
+                    "$select",
+                    "internetMessageId,internetMessageHeaders,from,replyTo,toRecipients,\
+                     ccRecipients,subject,receivedDateTime"
+                        .to_string(),
+                )],
+                None,
+            )
+            .await?;
+        let references = g
+            .internet_message_headers
+            .unwrap_or_default()
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("References"))
+            .map(|h| parse_references(&h.value))
+            .unwrap_or_default();
+        Ok(ReplyContext {
+            internet_message_id: g.internet_message_id,
+            references,
+            from: g.from.and_then(rec_to_email),
+            reply_to: g
+                .reply_to
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(rec_to_email)
+                .collect(),
+            to: g
+                .to_recipients
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(rec_to_email)
+                .collect(),
+            cc: g
+                .cc_recipients
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(rec_to_email)
+                .collect(),
+            subject: g.subject.unwrap_or_default(),
+            received_at: g
+                .received_date_time
+                .as_deref()
+                .and_then(parse_epoch)
+                .unwrap_or(0),
+        })
     }
 
     /// Lazy body fetch for a single message. Returns RAW content — the

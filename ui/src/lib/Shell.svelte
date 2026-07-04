@@ -1,15 +1,23 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  import { invoke } from '@tauri-apps/api/core'
   import { getCurrentWindow } from '@tauri-apps/api/window'
-  import { LogOut, RefreshCw } from 'lucide-svelte'
+  import { LogOut, PenLine, RefreshCw, Settings2 } from 'lucide-svelte'
   import FolderTree from './FolderTree.svelte'
   import MessageList from './MessageList.svelte'
   import ReadingPane from './ReadingPane.svelte'
+  import SignatureSettings from './SignatureSettings.svelte'
   import StatusBar from './StatusBar.svelte'
   import { initMail, mail, selectedFolder, syncNow } from './mail.svelte'
 
   type Account = { upn: string; display_name: string }
   let { account, onsignout }: { account: Account; onsignout: () => void } = $props()
+
+  let showSignatures = $state(false)
+
+  function composeNew() {
+    void invoke('open_compose', { mode: 'new', messageId: null })
+  }
 
   onMount(() => {
     void initMail()
@@ -32,6 +40,9 @@
 <div class="shell">
   <header class="toolbar">
     <span class="wordmark">SPITE</span>
+    <button class="sp-btn sp-btn--primary" onclick={composeNew}>
+      <PenLine size={13} /> Compose
+    </button>
     <span class="folder-name">{selectedFolder()?.display_name ?? ''}</span>
     <span class="spacer"></span>
     <button
@@ -43,11 +54,18 @@
       <RefreshCw size={13} />
       {mail.syncing ? 'Syncing…' : 'Sync'}
     </button>
+    <button class="sp-btn" onclick={() => (showSignatures = true)} title="Signatures">
+      <Settings2 size={13} />
+    </button>
     <span class="account" title={account.upn}>{account.display_name}</span>
     <button class="sp-btn" onclick={onsignout} title="Sign out">
       <LogOut size={13} />
     </button>
   </header>
+
+  {#if showSignatures}
+    <SignatureSettings onclose={() => (showSignatures = false)} />
+  {/if}
 
   <div class="panes">
     <aside class="folders sp-scroll">

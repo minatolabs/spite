@@ -103,6 +103,22 @@ pub trait MailStore: Send + Sync {
     ) -> Result<(), MailStoreError>;
     fn get_sync_state(&self, folder_id: &str) -> Result<Option<SyncState>, MailStoreError>;
     fn set_sync_state(&self, state: &SyncState) -> Result<(), MailStoreError>;
+    /// Bump autocomplete history for successfully-sent recipients.
+    fn record_recipients(
+        &self,
+        recipients: &[(String, String)],
+        now: i64,
+    ) -> Result<(), MailStoreError>;
+    /// Ranked (address, name) suggestions from send history + received-from
+    /// frequency. Purely local — works offline.
+    fn search_recipients(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String)>, MailStoreError>;
+    fn get_signature(&self, account: &str, kind: &str) -> Result<Option<String>, MailStoreError>;
+    fn set_signature(&self, account: &str, kind: &str, content: &str)
+        -> Result<(), MailStoreError>;
 }
 
 fn migrations() -> Migrations<'static> {
@@ -141,6 +157,21 @@ fn migrations() -> Migrations<'static> {
         CREATE TABLE sender_prefs (
             address             TEXT PRIMARY KEY,
             allow_remote_images INTEGER NOT NULL DEFAULT 0
+        );",
+        ),
+        // v3 (Phase 5): local autocomplete history + client-side signatures.
+        M::up(
+            "CREATE TABLE contacts (
+            address   TEXT PRIMARY KEY,
+            name      TEXT NOT NULL DEFAULT '',
+            uses      INTEGER NOT NULL DEFAULT 0,
+            last_used INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE signatures (
+            account TEXT NOT NULL,
+            kind    TEXT NOT NULL,
+            content TEXT NOT NULL,
+            PRIMARY KEY (account, kind)
         );",
         ),
     ])
@@ -418,6 +449,95 @@ impl MailStore for SqliteMailStore {
         )?;
         Ok(())
     }
+
+    fn record_recipients(
+        &self,
+        recipients: &[(String, String)],
+        now: i64,
+    ) -> Result<(), MailStoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO contacts (address, name, uses, last_used) VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(address) DO UPDATE SET
+                     uses = uses + 1,
+                     last_used = excluded.last_used,
+                     name = CASE WHEN excluded.name <> '' THEN excluded.name
+                                 ELSE contacts.name END",
+            )?;
+            for (address, name) in recipients {
+                if !address.is_empty() {
+                    stmt.execute(params![address.to_lowercase(), name, now])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn search_recipients(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String)>, MailStoreError> {
+        let pattern = format!(
+            "%{}%",
+            query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let conn = self.conn.lock().unwrap();
+        // Explicitly-used addresses (contacts) rank above mere senders.
+        let mut stmt = conn.prepare(
+            "SELECT address, MAX(name) AS name, SUM(score) AS total FROM (
+                 SELECT address, name, uses * 10 AS score FROM contacts
+                  WHERE address LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\'
+                 UNION ALL
+                 SELECT lower(from_address), from_name, COUNT(*) FROM messages
+                  WHERE from_address <> ''
+                    AND (from_address LIKE ?1 ESCAPE '\\' OR from_name LIKE ?1 ESCAPE '\\')
+                  GROUP BY lower(from_address), from_name
+             )
+             GROUP BY address
+             ORDER BY total DESC, address
+             LIMIT ?2",
+        )?;
+        let results = stmt
+            .query_map(params![pattern, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(results)
+    }
+
+    fn get_signature(&self, account: &str, kind: &str) -> Result<Option<String>, MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let content = conn
+            .query_row(
+                "SELECT content FROM signatures WHERE account = ?1 AND kind = ?2",
+                params![account, kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(content)
+    }
+
+    fn set_signature(
+        &self,
+        account: &str,
+        kind: &str,
+        content: &str,
+    ) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO signatures (account, kind, content) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account, kind) DO UPDATE SET content = excluded.content",
+            params![account, kind, content],
+        )?;
+        Ok(())
+    }
 }
 
 /// In-memory store for tests. Mirrors `SqliteMailStore` semantics, including
@@ -428,6 +548,10 @@ pub struct MemoryMailStore {
     messages: Mutex<HashMap<String, Message>>,
     sync_state: Mutex<HashMap<String, SyncState>>,
     sender_prefs: Mutex<HashMap<String, bool>>,
+    /// address → (name, uses, last_used)
+    contacts: Mutex<HashMap<String, (String, u32, i64)>>,
+    /// (account, kind) → content
+    signatures: Mutex<HashMap<(String, String), String>>,
 }
 
 impl MailStore for MemoryMailStore {
@@ -549,6 +673,90 @@ impl MailStore for MemoryMailStore {
             .insert(state.folder_id.clone(), state.clone());
         Ok(())
     }
+
+    fn record_recipients(
+        &self,
+        recipients: &[(String, String)],
+        now: i64,
+    ) -> Result<(), MailStoreError> {
+        let mut map = self.contacts.lock().unwrap();
+        for (address, name) in recipients {
+            if address.is_empty() {
+                continue;
+            }
+            let entry = map
+                .entry(address.to_lowercase())
+                .or_insert_with(|| (String::new(), 0, 0));
+            entry.1 += 1;
+            entry.2 = now;
+            if !name.is_empty() {
+                entry.0 = name.clone();
+            }
+        }
+        Ok(())
+    }
+
+    fn search_recipients(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String)>, MailStoreError> {
+        let q = query.to_lowercase();
+        let matches = |addr: &str, name: &str| {
+            addr.to_lowercase().contains(&q) || name.to_lowercase().contains(&q)
+        };
+        // address → (name, score)
+        let mut scored: HashMap<String, (String, i64)> = HashMap::new();
+        for (address, (name, uses, _)) in self.contacts.lock().unwrap().iter() {
+            if matches(address, name) {
+                let e = scored.entry(address.clone()).or_default();
+                e.0 = name.clone();
+                e.1 += i64::from(*uses) * 10;
+            }
+        }
+        for m in self.messages.lock().unwrap().values() {
+            let addr = m.summary.from_address.to_lowercase();
+            if !addr.is_empty() && matches(&addr, &m.summary.from_name) {
+                let e = scored.entry(addr).or_default();
+                if e.0.is_empty() {
+                    e.0 = m.summary.from_name.clone();
+                }
+                e.1 += 1;
+            }
+        }
+        let mut results: Vec<_> = scored
+            .into_iter()
+            .map(|(addr, (name, score))| (addr, name, score))
+            .collect();
+        results.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        Ok(results
+            .into_iter()
+            .take(limit as usize)
+            .map(|(addr, name, _)| (addr, name))
+            .collect())
+    }
+
+    fn get_signature(&self, account: &str, kind: &str) -> Result<Option<String>, MailStoreError> {
+        Ok(self
+            .signatures
+            .lock()
+            .unwrap()
+            .get(&(account.to_string(), kind.to_string()))
+            .cloned())
+    }
+
+    fn set_signature(
+        &self,
+        account: &str,
+        kind: &str,
+        content: &str,
+    ) -> Result<(), MailStoreError> {
+        self.signatures
+            .lock()
+            .unwrap()
+            .insert((account.to_string(), kind.to_string()), content.to_string());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -657,6 +865,45 @@ mod tests {
         store.set_sender_pref("a@example.com", false).unwrap();
         assert!(!store.get_sender_pref("a@example.com").unwrap());
 
+        // Recipient history: contact score (uses × 10) outranks a single
+        // received-from hit; matching is case-insensitive over name+address.
+        store
+            .record_recipients(&[("Colleague@Example.com".into(), "Colleague".into())], 100)
+            .unwrap();
+        store
+            .record_recipients(&[("colleague@example.com".into(), String::new())], 200)
+            .unwrap();
+        let hits = store.search_recipients("colleague", 5).unwrap();
+        assert_eq!(hits.len(), 1, "recording twice must not duplicate");
+        assert_eq!(
+            hits[0],
+            ("colleague@example.com".into(), "Colleague".into())
+        );
+        // The message sender seeded above is also findable, ranked below.
+        let hits = store.search_recipients("sender", 5).unwrap();
+        assert_eq!(hits[0].0, "sender@example.com");
+        assert!(store
+            .search_recipients("zzz-no-match", 5)
+            .unwrap()
+            .is_empty());
+
+        // Signatures: per account + kind, overwrite wins.
+        assert!(store.get_signature("me@x.com", "new").unwrap().is_none());
+        store.set_signature("me@x.com", "new", "— Me").unwrap();
+        store
+            .set_signature("me@x.com", "reply", "— Me (reply)")
+            .unwrap();
+        store.set_signature("me@x.com", "new", "— Me v2").unwrap();
+        assert_eq!(
+            store.get_signature("me@x.com", "new").unwrap().as_deref(),
+            Some("— Me v2")
+        );
+        assert_eq!(
+            store.get_signature("me@x.com", "reply").unwrap().as_deref(),
+            Some("— Me (reply)")
+        );
+        assert!(store.get_signature("other@x.com", "new").unwrap().is_none());
+
         // Deletion: removes the row; deleting again (or a missing id) is a no-op.
         store
             .upsert_messages(&[message("gone", "f1", 50, None)])
@@ -711,7 +958,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
@@ -719,7 +966,14 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        for required in ["folders", "messages", "sync_state", "sender_prefs"] {
+        for required in [
+            "folders",
+            "messages",
+            "sync_state",
+            "sender_prefs",
+            "contacts",
+            "signatures",
+        ] {
             assert!(tables.iter().any(|t| t == required), "missing {required}");
         }
     }

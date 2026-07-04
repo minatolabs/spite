@@ -172,6 +172,12 @@ impl Authenticator {
             .ok_or(AuthError::NeedsSignIn)
     }
 
+    /// The signed-in account's stored metadata (UPN, display name), if any.
+    /// Reads local state only — no network, no token refresh.
+    pub fn current_account(&self) -> Result<Option<Account>, AuthError> {
+        self.read_state()
+    }
+
     /// Drop the cached access token so the next `access_token()` call
     /// refreshes. Used when Graph rejects a token (401) that our local
     /// expiry bookkeeping still considered valid.

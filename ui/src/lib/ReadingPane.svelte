@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
-  import { ImageOff, Mail } from 'lucide-svelte'
+  import { Forward, ImageOff, Mail, Reply, ReplyAll } from 'lucide-svelte'
   import { mail, type Message, type MessageBody } from './mail.svelte'
 
   let message: Message | null = $state(null)
@@ -82,6 +82,11 @@
     allowRemote = true
   }
 
+  function openCompose(composeMode: 'reply' | 'replyAll' | 'forward') {
+    if (!mail.selectedId) return
+    void invoke('open_compose', { mode: composeMode, messageId: mail.selectedId })
+  }
+
   function fmtDate(epoch: number): string {
     if (!epoch) return ''
     return new Date(epoch * 1000).toLocaleString(undefined, {
@@ -111,6 +116,17 @@
             <span class="from-addr">&lt;{message.summary.from_address}&gt;</span>
           {/if}
           <span class="date">{fmtDate(message.summary.received_at)}</span>
+        </p>
+        <p class="msg-actions">
+          <button class="sp-btn" onclick={() => openCompose('reply')}>
+            <Reply size={13} /> Reply
+          </button>
+          <button class="sp-btn" onclick={() => openCompose('replyAll')}>
+            <ReplyAll size={13} /> Reply all
+          </button>
+          <button class="sp-btn" onclick={() => openCompose('forward')}>
+            <Forward size={13} /> Forward
+          </button>
         </p>
       </header>
     {/if}
@@ -202,6 +218,12 @@
   .date {
     margin-left: auto;
     color: var(--sp-text-tertiary);
+  }
+
+  .msg-actions {
+    margin: var(--sp-3) 0 0;
+    display: flex;
+    gap: var(--sp-2);
   }
 
   .images-bar {

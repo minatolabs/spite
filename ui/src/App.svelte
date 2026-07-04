@@ -2,7 +2,11 @@
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+  import Composer from './lib/Composer.svelte'
   import Shell from './lib/Shell.svelte'
+
+  const urlParams = new URLSearchParams(window.location.search)
+  const composeLabel = urlParams.get('compose') ? urlParams.get('label') : null
 
   type Account = { upn: string; display_name: string }
   type DeviceCodePrompt = {
@@ -55,7 +59,9 @@
   }
 </script>
 
-{#if account}
+{#if composeLabel}
+  <Composer label={composeLabel} />
+{:else if account}
   <Shell {account} onsignout={signOut} />
 {:else}
   <main class="gate">

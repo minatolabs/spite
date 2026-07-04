@@ -68,13 +68,27 @@ Sign-in uses the OAuth 2.0 device-code flow: the app shows a code and
 token is stored in the OS keychain (Secret Service / Keychain / Credential
 Manager), never on disk.
 
+## Sending mail
+
+- Sends go through Graph `sendMail` as a complete **MIME message built in
+  Rust** — the JSON payload can't carry standard headers, and MIME is the
+  only way to set `In-Reply-To`/`References` so replies thread correctly in
+  recipients' clients. Scope is `Mail.Send` only.
+- **Inline attachments are capped at 2 MB total** (Graph's 4 MB request limit
+  ÷ base64 expansion). Larger files need upload sessions, which require
+  `Mail.ReadWrite` — a later phase.
+- **Signatures are client-side** (stored in Spite's local database, with
+  separate new-message and reply variants). This is a Graph platform
+  limitation: Outlook's roaming signatures are not exposed to third-party
+  clients at all.
+
 ## Roadmap (v0.1)
 
 - [x] Phase 0 — Tauri 2 scaffold
 - [x] Phase 1 — device-code auth, tokens in OS keychain
 - [x] Phase 2 — local SQLite store + migrations
 - [x] Phase 3 — Graph delta sync
-- [ ] Phase 4 — read UI (offline-capable list + message view)
+- [x] Phase 4 — read UI (offline-capable list + message view)
 - [ ] Phase 5 — compose + send
 - [ ] Phase 6 — local full-text search (FTS5)
 
