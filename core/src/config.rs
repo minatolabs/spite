@@ -14,6 +14,8 @@ pub const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com/common";
 pub const CONFIG_FILE: &str = "config.json";
 /// Initial-sync window size: how many recent messages to backfill.
 pub const DEFAULT_BACKFILL_COUNT: u32 = 200;
+/// Undo-send window: seconds a queued message waits before actually sending.
+pub const DEFAULT_UNDO_SEND_SECONDS: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -23,6 +25,8 @@ pub struct AppConfig {
     pub db_path: Option<PathBuf>,
     /// Recent messages to backfill on first sync (clamped to 1..=1000).
     pub backfill_count: u32,
+    /// Undo-send delay in seconds (clamped to 0..=120; 0 sends immediately).
+    pub undo_send_seconds: u32,
 }
 
 impl Default for AppConfig {
@@ -32,6 +36,7 @@ impl Default for AppConfig {
             authority: DEFAULT_AUTHORITY.to_string(),
             db_path: None,
             backfill_count: DEFAULT_BACKFILL_COUNT,
+            undo_send_seconds: DEFAULT_UNDO_SEND_SECONDS,
         }
     }
 }
@@ -43,6 +48,7 @@ struct ConfigOverrides {
     authority: Option<String>,
     db_path: Option<PathBuf>,
     backfill_count: Option<u32>,
+    undo_send_seconds: Option<u32>,
 }
 
 impl AppConfig {
@@ -64,6 +70,9 @@ impl AppConfig {
                     }
                     if let Some(v) = overrides.backfill_count {
                         cfg.backfill_count = v;
+                    }
+                    if let Some(v) = overrides.undo_send_seconds {
+                        cfg.undo_send_seconds = v;
                     }
                 }
                 Err(e) => eprintln!("spite: ignoring malformed {}: {e}", path.display()),
@@ -134,5 +143,20 @@ mod tests {
         );
         std::fs::write(dir.path().join(CONFIG_FILE), r#"{ "backfill_count": 50 }"#).unwrap();
         assert_eq!(AppConfig::load(dir.path()).backfill_count, 50);
+    }
+
+    #[test]
+    fn undo_send_seconds_default_and_override() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            AppConfig::load(dir.path()).undo_send_seconds,
+            DEFAULT_UNDO_SEND_SECONDS
+        );
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"{ "undo_send_seconds": 30 }"#,
+        )
+        .unwrap();
+        assert_eq!(AppConfig::load(dir.path()).undo_send_seconds, 30);
     }
 }

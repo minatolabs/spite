@@ -6,6 +6,7 @@
   import FolderTree from './FolderTree.svelte'
   import MessageList from './MessageList.svelte'
   import ReadingPane from './ReadingPane.svelte'
+  import SendToasts from './SendToasts.svelte'
   import SignatureSettings from './SignatureSettings.svelte'
   import StatusBar from './StatusBar.svelte'
   import { initMail, mail, selectedFolder, syncNow } from './mail.svelte'
@@ -66,6 +67,8 @@
   {#if showSignatures}
     <SignatureSettings onclose={() => (showSignatures = false)} />
   {/if}
+
+  <SendToasts />
 
   <div class="panes">
     <aside class="folders sp-scroll">

@@ -15,9 +15,77 @@ use spite_core::sync::{sync_folder as run_sync_folder, SyncReport};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Pending compose-window parameters, keyed by window label. Avoids pushing
-/// Graph message ids through URL query encoding.
+/// Graph message ids (or whole drafts) through URL query encoding.
+#[derive(Clone)]
+enum ComposeParams {
+    /// Fresh compose/reply/forward built from an original message.
+    Original {
+        mode: String,
+        message_id: Option<String>,
+    },
+    /// A draft coming back from Undo or from a failed send.
+    Restore { draft: Draft, error: Option<String> },
+}
+
 #[derive(Default)]
-struct ComposeRegistry(Mutex<HashMap<String, (String, Option<String>)>>);
+struct ComposeRegistry {
+    params: Mutex<HashMap<String, ComposeParams>>,
+    label_seq: std::sync::atomic::AtomicU64,
+}
+
+/// Undo-send queue: drafts wait out the countdown here. The timer task
+/// claims a draft by removing it — an entry that is gone was either undone
+/// or already sent, so claim-by-remove is the cancellation mechanism.
+#[derive(Default)]
+struct SendQueue {
+    pending: Mutex<HashMap<u64, Draft>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SendQueuedEvent {
+    id: u64,
+    subject: String,
+    recipients: usize,
+    /// Unix millis when the send fires; the toast counts down to this.
+    deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SendResultEvent {
+    id: u64,
+    error: Option<String>,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn open_compose_window(app: &AppHandle, params: ComposeParams) -> Result<(), String> {
+    let registry = app.state::<ComposeRegistry>();
+    let seq = registry
+        .label_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let label = format!("compose-{}-{seq}", now_ms());
+    registry
+        .params
+        .lock()
+        .unwrap()
+        .insert(label.clone(), params);
+    tauri::WebviewWindowBuilder::new(
+        app,
+        &label,
+        tauri::WebviewUrl::App(format!("index.html?compose=1&label={label}").into()),
+    )
+    .title("Compose — Spite")
+    .inner_size(760.0, 680.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 /// Store access is blocking (SQLite behind a mutex) — keep it off the async
 /// runtime, mirroring the pattern in spite-core.
@@ -197,32 +265,10 @@ async fn set_sender_pref(
 #[tauri::command]
 async fn open_compose(
     app: AppHandle,
-    registry: State<'_, ComposeRegistry>,
     mode: String,
     message_id: Option<String>,
 ) -> Result<(), String> {
-    let label = format!(
-        "compose-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_millis()
-    );
-    registry
-        .0
-        .lock()
-        .unwrap()
-        .insert(label.clone(), (mode, message_id));
-    tauri::WebviewWindowBuilder::new(
-        &app,
-        &label,
-        tauri::WebviewUrl::App(format!("index.html?compose=1&label={label}").into()),
-    )
-    .title("Compose — Spite")
-    .inner_size(760.0, 680.0)
-    .build()
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    open_compose_window(&app, ComposeParams::Original { mode, message_id })
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +286,29 @@ struct ComposeContext {
     /// (offline): threading headers may be missing and reply-all may have
     /// degraded to reply.
     degraded: bool,
+    /// A restored draft (Undo or failed send) — when set, the composer
+    /// loads these fields verbatim and ignores the ones above.
+    restored: Option<Draft>,
+    /// Why the draft came back, if it came back from a failure.
+    restore_error: Option<String>,
+}
+
+impl ComposeContext {
+    fn empty(mode: String, signature: Option<String>) -> Self {
+        Self {
+            mode,
+            to: vec![],
+            cc: vec![],
+            subject: String::new(),
+            quoted_html: None,
+            in_reply_to: None,
+            references: vec![],
+            signature,
+            degraded: false,
+            restored: None,
+            restore_error: None,
+        }
+    }
 }
 
 #[tauri::command]
@@ -249,13 +318,23 @@ async fn get_compose_context(
     auth: State<'_, Arc<Authenticator>>,
     store: State<'_, Arc<dyn MailStore>>,
 ) -> Result<ComposeContext, String> {
-    let (mode_str, message_id) = registry
-        .0
+    let params = registry
+        .params
         .lock()
         .unwrap()
         .get(&label)
         .cloned()
         .ok_or_else(|| "unknown compose window".to_string())?;
+    let (mode_str, message_id) = match params {
+        ComposeParams::Restore { draft, error } => {
+            return Ok(ComposeContext {
+                restored: Some(draft),
+                restore_error: error,
+                ..ComposeContext::empty("restore".to_string(), None)
+            });
+        }
+        ComposeParams::Original { mode, message_id } => (mode, message_id),
+    };
     let mode = match mode_str.as_str() {
         "reply" => ComposeMode::Reply,
         "replyAll" => ComposeMode::ReplyAll,
@@ -279,17 +358,7 @@ async fn get_compose_context(
     };
 
     if matches!(mode, ComposeMode::New) {
-        return Ok(ComposeContext {
-            mode: mode_str,
-            to: vec![],
-            cc: vec![],
-            subject: String::new(),
-            quoted_html: None,
-            in_reply_to: None,
-            references: vec![],
-            signature,
-            degraded: false,
-        });
+        return Ok(ComposeContext::empty(mode_str, signature));
     }
 
     let message_id = message_id.ok_or_else(|| "missing original message id".to_string())?;
@@ -376,27 +445,31 @@ async fn get_compose_context(
     };
 
     Ok(ComposeContext {
-        mode: mode_str,
         to,
         cc,
         subject,
         quoted_html,
         in_reply_to,
         references,
-        signature,
         degraded,
+        ..ComposeContext::empty(mode_str, signature)
     })
 }
 
-/// Build MIME and send. On success, recipients feed the local autocomplete
-/// history. On failure the error string returns to the composer, which keeps
-/// the draft — content is never lost here.
+/// Undo-send model: validate the draft, park it in the queue, and schedule
+/// the real send after the configured countdown. Returns as soon as the
+/// draft is queued — the composer closes immediately and the main window
+/// shows the "Sending… Undo" toast (driven by the `send:*` events).
 #[tauri::command]
-async fn send_mail(
+async fn queue_send(
+    app: AppHandle,
     draft: Draft,
+    queue: State<'_, Arc<SendQueue>>,
     auth: State<'_, Arc<Authenticator>>,
-    store: State<'_, Arc<dyn MailStore>>,
+    config: State<'_, AppConfig>,
 ) -> Result<(), String> {
+    // Validate now, while the composer is still open to show the error:
+    // recipient presence, attachment size/encoding, MIME buildability.
     let account = auth
         .current_account()
         .map_err(|e| e.to_string())?
@@ -405,28 +478,109 @@ async fn send_mail(
         name: account.display_name,
         address: account.upn,
     };
-    let mime = compose::build_mime(&draft, &from).map_err(|e| e.to_string())?;
+    compose::build_mime(&draft, &from).map_err(|e| e.to_string())?;
 
-    let source = GraphMailSource::new(Arc::clone(&auth));
-    source
-        .send_mime(&mime)
-        .await
-        .map_err(|e| format!("send failed: {e}"))?;
+    let id = queue
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let delay_secs = config.undo_send_seconds.min(120);
+    let event = SendQueuedEvent {
+        id,
+        subject: draft.subject.clone(),
+        recipients: draft.to.len() + draft.cc.len() + draft.bcc.len(),
+        deadline_ms: now_ms() + u64::from(delay_secs) * 1000,
+    };
+    queue.pending.lock().unwrap().insert(id, draft);
+    let _ = app.emit("send:queued", &event);
 
-    let recipients: Vec<(String, String)> = draft
-        .to
-        .iter()
-        .chain(&draft.cc)
-        .chain(&draft.bcc)
-        .map(|a| (a.address.clone(), a.name.clone()))
-        .collect();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    // History is best-effort; the mail is already sent.
-    let _ = store_call(&store, move |s| s.record_recipients(&recipients, now)).await;
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if delay_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(delay_secs))).await;
+        }
+        perform_send(&handle, id).await;
+    });
     Ok(())
+}
+
+/// Cancel a queued send and hand the draft back in a fresh composer window.
+/// Claiming the draft out of the queue is the cancellation: the timer task
+/// finds nothing to send.
+#[tauri::command]
+async fn undo_send(
+    app: AppHandle,
+    id: u64,
+    queue: State<'_, Arc<SendQueue>>,
+) -> Result<(), String> {
+    let draft = queue
+        .pending
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or_else(|| "too late — already sent".to_string())?;
+    open_compose_window(&app, ComposeParams::Restore { draft, error: None })
+}
+
+/// Fire a queued send. On failure the draft is never dropped: it reopens in
+/// a composer window with the error, and the toast reports what happened.
+async fn perform_send(app: &AppHandle, id: u64) {
+    let queue = app.state::<Arc<SendQueue>>();
+    // Claim by removal; a missing entry means the user undid it.
+    let Some(draft) = queue.pending.lock().unwrap().remove(&id) else {
+        return;
+    };
+
+    let auth = Arc::clone(&app.state::<Arc<Authenticator>>());
+    let result: Result<(), String> = async {
+        let account = auth
+            .current_account()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not signed in".to_string())?;
+        let from = EmailAddress {
+            name: account.display_name,
+            address: account.upn,
+        };
+        let mime = compose::build_mime(&draft, &from).map_err(|e| e.to_string())?;
+        GraphMailSource::new(Arc::clone(&auth))
+            .send_mime(&mime)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            let _ = app.emit("send:sent", &SendResultEvent { id, error: None });
+            let recipients: Vec<(String, String)> = draft
+                .to
+                .iter()
+                .chain(&draft.cc)
+                .chain(&draft.bcc)
+                .map(|a| (a.address.clone(), a.name.clone()))
+                .collect();
+            let now = (now_ms() / 1000) as i64;
+            let store = Arc::clone(&app.state::<Arc<dyn MailStore>>());
+            // History is best-effort; the mail is already sent.
+            let _ = store_call(&store, move |s| s.record_recipients(&recipients, now)).await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "queued send failed; reopening draft");
+            let _ = app.emit(
+                "send:failed",
+                &SendResultEvent {
+                    id,
+                    error: Some(e.clone()),
+                },
+            );
+            let _ = open_compose_window(
+                app,
+                ComposeParams::Restore {
+                    draft,
+                    error: Some(format!("send failed: {e}")),
+                },
+            );
+        }
+    }
 }
 
 #[tauri::command]
@@ -501,6 +655,7 @@ pub fn run() {
             app.manage(auth);
             app.manage(config);
             app.manage(ComposeRegistry::default());
+            app.manage(Arc::new(SendQueue::default()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -519,11 +674,30 @@ pub fn run() {
             set_sender_pref,
             open_compose,
             get_compose_context,
-            send_mail,
+            queue_send,
+            undo_send,
             autocomplete_recipients,
             get_signature,
             set_signature
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Quitting mid-countdown must not drop queued mail: the user
+            // pressed Send, so fire the pending sends now instead of never.
+            // (Bounded by the HTTP client's 30s timeout per message.)
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let queue = app_handle.state::<Arc<SendQueue>>();
+                let ids: Vec<u64> = queue.pending.lock().unwrap().keys().copied().collect();
+                if !ids.is_empty() {
+                    tracing::info!(count = ids.len(), "flushing queued sends before exit");
+                    let handle = app_handle.clone();
+                    tauri::async_runtime::block_on(async move {
+                        for id in ids {
+                            perform_send(&handle, id).await;
+                        }
+                    });
+                }
+            }
+        });
 }

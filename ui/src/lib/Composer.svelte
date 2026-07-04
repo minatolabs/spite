@@ -16,6 +16,17 @@
   import AddressField from './AddressField.svelte'
 
   type EmailAddress = { name: string; address: string }
+  type Draft = {
+    to: EmailAddress[]
+    cc: EmailAddress[]
+    bcc: EmailAddress[]
+    subject: string
+    body: string
+    content_type: string
+    in_reply_to: string | null
+    references: string[]
+    attachments: { name: string; content_type: string; content_base64: string }[]
+  }
   type ComposeContext = {
     mode: string
     to: EmailAddress[]
@@ -26,6 +37,8 @@
     references: string[]
     signature: string | null
     degraded: boolean
+    restored: Draft | null
+    restore_error: string | null
   }
   type Attachment = { name: string; content_type: string; content_base64: string; size: number }
 
@@ -48,33 +61,68 @@
   let degraded = $state(false)
   let loading = $state(true)
   let sending = $state(false)
-  let confirming = $state(false)
   let error = $state('')
   let attachError = $state('')
   let dirty = $state(false)
+  let initialHtml = $state('')
+  let initialApplied = false
 
   function escapeHtml(s: string): string {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   }
+
+  // The contenteditable div only mounts once loading is false, so the
+  // initial content has to be applied when the element appears — setting
+  // innerHTML inside onMount raced the {#if} and lost.
+  $effect(() => {
+    if (bodyEl && !initialApplied) {
+      initialApplied = true
+      // Editor-bound HTML is Rust-sanitized (quotes) or locally authored
+      // (signatures/restored drafts) — nothing remote lands here raw.
+      bodyEl.innerHTML = initialHtml
+    }
+  })
 
   onMount(() => {
     void (async () => {
       try {
         const ctx = await invoke<ComposeContext>('get_compose_context', { label })
         mode = ctx.mode
-        to = ctx.to
-        cc = ctx.cc
-        showCcBcc = ctx.cc.length > 0
-        subject = ctx.subject
-        inReplyTo = ctx.in_reply_to
-        references = ctx.references
-        degraded = ctx.degraded
-        const sig = ctx.signature
-          ? `<p><br></p><p>--&nbsp;<br>${escapeHtml(ctx.signature).replace(/\n/g, '<br>')}</p>`
-          : '<p><br></p>'
-        if (bodyEl) {
+        if (ctx.restored) {
+          // Undo / failed send: load the draft exactly as it was.
+          const d = ctx.restored
+          to = d.to
+          cc = d.cc
+          bcc = d.bcc
+          showCcBcc = d.cc.length > 0 || d.bcc.length > 0
+          subject = d.subject
+          inReplyTo = d.in_reply_to
+          references = d.references
+          attachments = d.attachments.map((a) => ({
+            ...a,
+            size: Math.floor((a.content_base64.length * 3) / 4),
+          }))
+          if (d.content_type === 'text') {
+            plainText = true
+            textBody = d.body
+          } else {
+            initialHtml = d.body
+          }
+          error = ctx.restore_error ?? ''
+          dirty = true
+        } else {
+          to = ctx.to
+          cc = ctx.cc
+          showCcBcc = ctx.cc.length > 0
+          subject = ctx.subject
+          inReplyTo = ctx.in_reply_to
+          references = ctx.references
+          degraded = ctx.degraded
+          const sig = ctx.signature
+            ? `<p><br></p><p>--&nbsp;<br>${escapeHtml(ctx.signature).replace(/\n/g, '<br>')}</p>`
+            : '<p><br></p>'
           // quoted_html is sanitized in Rust (ammonia) before it gets here.
-          bodyEl.innerHTML = sig + (ctx.quoted_html ? `<hr>${ctx.quoted_html}` : '')
+          initialHtml = sig + (ctx.quoted_html ? `<hr>${ctx.quoted_html}` : '')
         }
       } catch (e) {
         error = String(e)
@@ -112,8 +160,11 @@
   function togglePlainText() {
     if (!plainText) {
       textBody = bodyEl?.innerText ?? ''
-    } else if (bodyEl) {
-      bodyEl.innerHTML = `<p>${escapeHtml(textBody).replace(/\n/g, '<br>')}</p>`
+    } else {
+      // The rich editor mounts only after the flag flips — hand the content
+      // to the mount effect instead of touching the not-yet-bound element.
+      initialHtml = `<p>${escapeHtml(textBody).replace(/\n/g, '<br>')}</p>`
+      initialApplied = false
     }
     plainText = !plainText
     markDirty()
@@ -155,22 +206,20 @@
 
   let recipientCount = $derived(to.length + cc.length + bcc.length)
 
-  function requestSend() {
+  /// Undo-send model: queue_send validates and parks the draft in the Rust
+  /// shell, then this window closes immediately — the main window shows the
+  /// countdown toast, and the real send fires when it elapses (or reopens
+  /// here via Undo). Validation errors keep the draft in this window.
+  async function send() {
     error = ''
     if (!recipientCount) {
       error = 'Add at least one recipient.'
       return
     }
-    confirming = true
-  }
-
-  async function confirmSend() {
-    confirming = false
     sending = true
-    error = ''
     try {
       const body = plainText ? textBody : (bodyEl?.innerHTML ?? '')
-      await invoke('send_mail', {
+      await invoke('queue_send', {
         draft: {
           to,
           cc,
@@ -190,7 +239,7 @@
       dirty = false
       await getCurrentWindow().close()
     } catch (e) {
-      // Draft stays exactly as composed; the user can fix and retry.
+      // Rejected before queueing (validation): draft stays right here.
       error = String(e)
     } finally {
       sending = false
@@ -200,7 +249,7 @@
   function onKeydown(e: KeyboardEvent) {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       e.preventDefault()
-      requestSend()
+      void send()
     }
   }
 </script>
@@ -293,21 +342,11 @@
   {/if}
 
   <footer class="actions">
-    {#if confirming}
-      <span class="confirm-text">
-        Send to {recipientCount} recipient{recipientCount === 1 ? '' : 's'}?
-      </span>
-      <button class="sp-btn sp-btn--primary" onclick={confirmSend} disabled={sending}>
-        <Send size={13} /> Confirm send
-      </button>
-      <button class="sp-btn" onclick={() => (confirming = false)}>Back</button>
-    {:else}
-      <button class="sp-btn sp-btn--primary" onclick={requestSend} disabled={sending || loading}>
-        <Send size={13} />
-        {sending ? 'Sending…' : 'Send'}
-      </button>
-      <span class="hint">Ctrl+Enter to send · plain Enter never sends</span>
-    {/if}
+    <button class="sp-btn sp-btn--primary" onclick={() => void send()} disabled={sending || loading}>
+      <Send size={13} />
+      {sending ? 'Queueing…' : 'Send'}
+    </button>
+    <span class="hint">Ctrl+Enter to send · undo from the main window after sending</span>
   </footer>
 </main>
 
@@ -471,11 +510,6 @@
   .hint {
     font-size: var(--sp-fs-caption);
     color: var(--sp-text-muted);
-  }
-
-  .confirm-text {
-    font-size: var(--sp-fs-small);
-    color: var(--sp-text-display);
   }
 
   .state {

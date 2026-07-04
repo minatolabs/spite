@@ -56,7 +56,11 @@ Entra app registration:
   "db_path": "/path/to/spite.db",
   // optional; how many recent Inbox messages the first sync backfills.
   // Defaults to 200, clamped to 1..=1000.
-  "backfill_count": 200
+  "backfill_count": 200,
+  // optional; undo-send window in seconds (Gmail-style). The message
+  // actually sends only after this countdown; Undo cancels and reopens
+  // the draft. Defaults to 15, clamped to 0..=120 (0 sends immediately).
+  "undo_send_seconds": 15
 }
 ```
 
