@@ -84,7 +84,7 @@
             {#if remaining(t) > 0}&nbsp;in {remaining(t)}s{/if}…
           </span>
           <button class="sp-btn" onclick={() => void undo(t.id)}>
-            <Undo2 size={13} /> Undo
+            <Undo2 size={13} /> Cancel
           </button>
         {:else if t.state === 'sent'}
           <CircleCheck size={14} class="ok" />
@@ -105,11 +105,11 @@
   .stack {
     position: fixed;
     bottom: calc(var(--sp-h-statusbar) + var(--sp-3));
-    left: 50%;
-    transform: translateX(-50%);
+    right: var(--sp-4);
     z-index: var(--sp-z-toast);
     display: flex;
     flex-direction: column;
+    align-items: flex-end;
     gap: var(--sp-2);
   }
 

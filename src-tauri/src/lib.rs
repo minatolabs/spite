@@ -493,6 +493,12 @@ async fn queue_send(
     queue.pending.lock().unwrap().insert(id, draft);
     let _ = app.emit("send:queued", &event);
 
+    // The composer closes itself right after this returns; hand focus back
+    // to the main window so the countdown toast is in view.
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.set_focus();
+    }
+
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         if delay_secs > 0 {
