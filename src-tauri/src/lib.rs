@@ -632,6 +632,14 @@ async fn set_signature(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK's accelerated compositing crashes the WebKitWebProcess on
+    // some Linux driver/compositor combinations. Must be set before the
+    // first webview is created; an explicit user override wins.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -663,6 +671,22 @@ pub fn run() {
             app.manage(ComposeRegistry::default());
             app.manage(Arc::new(SendQueue::default()));
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing the main window must not orphan compose windows (the
+            // app only exits when every window is gone). Graceful close so
+            // a dirty composer's discard-draft guard can still intervene —
+            // if the user keeps a draft open, the app deliberately stays
+            // alive rather than dropping the content.
+            if window.label() == "main"
+                && matches!(event, tauri::WindowEvent::CloseRequested { .. })
+            {
+                for (label, compose) in window.app_handle().webview_windows() {
+                    if label.starts_with("compose-") {
+                        let _ = compose.close();
+                    }
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             sign_in,

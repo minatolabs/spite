@@ -122,7 +122,11 @@ pub trait MailStore: Send + Sync {
 }
 
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![
+    Migrations::new(migration_steps())
+}
+
+fn migration_steps() -> Vec<M<'static>> {
+    vec![
         M::up(
             "CREATE TABLE folders (
             id              TEXT PRIMARY KEY,
@@ -174,7 +178,33 @@ fn migrations() -> Migrations<'static> {
             PRIMARY KEY (account, kind)
         );",
         ),
-    ])
+        // v4: purge Exchange legacy X.500 DNs ('/o=.../cn=...') that leaked
+        // into autocomplete before addresses were SMTP-validated. The SQL
+        // approximates is_smtp_address(); the Rust filter is authoritative
+        // for everything written from here on.
+        M::up(
+            "DELETE FROM contacts
+              WHERE address LIKE '/%'
+                 OR address NOT LIKE '%_@_%.%';",
+        ),
+    ]
+}
+
+/// True only for plausible SMTP addresses: one `@` with a non-empty local
+/// part and a dotted domain. Rejects Exchange legacy X.500 DNs
+/// (`/o=…/cn=…`), which Graph sometimes returns in `emailAddress.address`.
+pub fn is_smtp_address(addr: &str) -> bool {
+    if addr.starts_with('/') {
+        return false;
+    }
+    let Some((local, domain)) = addr.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.contains('@')
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
 }
 
 pub struct SqliteMailStore {
@@ -467,7 +497,7 @@ impl MailStore for SqliteMailStore {
                                  ELSE contacts.name END",
             )?;
             for (address, name) in recipients {
-                if !address.is_empty() {
+                if is_smtp_address(address) {
                     stmt.execute(params![address.to_lowercase(), name, now])?;
                 }
             }
@@ -490,13 +520,16 @@ impl MailStore for SqliteMailStore {
         );
         let conn = self.conn.lock().unwrap();
         // Explicitly-used addresses (contacts) rank above mere senders.
+        // Both branches surface SMTP shapes only — Graph sender addresses
+        // can be Exchange legacy DNs, which never belong in suggestions.
         let mut stmt = conn.prepare(
             "SELECT address, MAX(name) AS name, SUM(score) AS total FROM (
                  SELECT address, name, uses * 10 AS score FROM contacts
-                  WHERE address LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\'
+                  WHERE (address LIKE ?1 ESCAPE '\\' OR name LIKE ?1 ESCAPE '\\')
+                    AND address NOT LIKE '/%' AND address LIKE '%_@_%.%'
                  UNION ALL
                  SELECT lower(from_address), from_name, COUNT(*) FROM messages
-                  WHERE from_address <> ''
+                  WHERE from_address NOT LIKE '/%' AND from_address LIKE '%_@_%.%'
                     AND (from_address LIKE ?1 ESCAPE '\\' OR from_name LIKE ?1 ESCAPE '\\')
                   GROUP BY lower(from_address), from_name
              )
@@ -681,7 +714,7 @@ impl MailStore for MemoryMailStore {
     ) -> Result<(), MailStoreError> {
         let mut map = self.contacts.lock().unwrap();
         for (address, name) in recipients {
-            if address.is_empty() {
+            if !is_smtp_address(address) {
                 continue;
             }
             let entry = map
@@ -716,7 +749,7 @@ impl MailStore for MemoryMailStore {
         }
         for m in self.messages.lock().unwrap().values() {
             let addr = m.summary.from_address.to_lowercase();
-            if !addr.is_empty() && matches(&addr, &m.summary.from_name) {
+            if is_smtp_address(&addr) && matches(&addr, &m.summary.from_name) {
                 let e = scored.entry(addr).or_default();
                 if e.0.is_empty() {
                     e.0 = m.summary.from_name.clone();
@@ -882,6 +915,34 @@ mod tests {
         // The message sender seeded above is also findable, ranked below.
         let hits = store.search_recipients("sender", 5).unwrap();
         assert_eq!(hits[0].0, "sender@example.com");
+
+        // Exchange legacy X.500 DNs and other non-SMTP shapes are never
+        // cached and never suggested — from either source branch.
+        store
+            .record_recipients(
+                &[
+                    (
+                        "/o=First Organization/ou=Exchange Administrative \
+                         Group/cn=Recipients/cn=abc123"
+                            .into(),
+                        "Legacy Dn".into(),
+                    ),
+                    ("not-an-address".into(), "No At".into()),
+                ],
+                300,
+            )
+            .unwrap();
+        assert!(store.search_recipients("Legacy", 5).unwrap().is_empty());
+        assert!(store.search_recipients("No At", 5).unwrap().is_empty());
+        let mut dn_msg = message("m-dn", "f1", 400, None);
+        dn_msg.summary.from_address = "/o=Org/ou=X/cn=Recipients/cn=dnsender".into();
+        dn_msg.summary.from_name = "Dn Sender".into();
+        store.upsert_messages(&[dn_msg]).unwrap();
+        assert!(
+            store.search_recipients("Dn Sender", 5).unwrap().is_empty(),
+            "message-derived DN sender must not surface"
+        );
+
         assert!(store
             .search_recipients("zzz-no-match", 5)
             .unwrap()
@@ -958,7 +1019,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
@@ -981,6 +1042,55 @@ mod tests {
     #[test]
     fn migrations_are_valid() {
         assert!(migrations().validate().is_ok());
+    }
+
+    #[test]
+    fn smtp_address_validation() {
+        for ok in [
+            "user@example.com",
+            "first.last@sub.example.co.uk",
+            "UPPER@Example.COM",
+        ] {
+            assert!(is_smtp_address(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "/o=First Organization/ou=Exchange Administrative Group/cn=Recipients/cn=abc",
+            "no-at-sign",
+            "@example.com",
+            "user@",
+            "user@localhost",
+            "user@.com",
+            "user@example.",
+            "a@b@c.com",
+            "",
+        ] {
+            assert!(!is_smtp_address(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn migration_v4_purges_legacy_dn_contacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spite.db");
+        // Build a v3 database by hand with a legacy row already present.
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let v3 = Migrations::new(migration_steps().into_iter().take(3).collect());
+            v3.to_latest(&mut conn).unwrap();
+            conn.execute(
+                "INSERT INTO contacts (address, name, uses, last_used) VALUES
+                 ('/o=org/ou=x/cn=recipients/cn=legacy', 'Legacy', 5, 1),
+                 ('keep@example.com', 'Keep', 3, 1),
+                 ('bare-string', '', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        // Opening through the store runs the v4 step.
+        let store = SqliteMailStore::open(&path).unwrap();
+        let hits = store.search_recipients("e", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "keep@example.com");
     }
 
     #[test]

@@ -157,6 +157,74 @@
     if (url && /^https?:\/\//i.test(url)) exec('createLink', url)
   }
 
+  /** Nearest ancestor of the caret matching `tag`, bounded by the editor. */
+  function closestTag(tag: string): HTMLElement | null {
+    let node: Node | null = window.getSelection()?.anchorNode ?? null
+    while (node && node !== bodyEl) {
+      if (node instanceof HTMLElement && node.tagName === tag) return node
+      node = node.parentNode
+    }
+    return null
+  }
+
+  /** True when the block the caret sits in has no visible text. */
+  function caretBlockIsEmpty(): boolean {
+    let node: Node | null = window.getSelection()?.anchorNode ?? null
+    while (
+      node &&
+      node.parentNode !== bodyEl &&
+      !(node instanceof HTMLElement && /^(P|DIV|LI|BLOCKQUOTE)$/.test(node.tagName))
+    ) {
+      node = node.parentNode
+    }
+    return (node?.textContent ?? '').trim() === ''
+  }
+
+  /**
+   * Enter semantics (WebKit's defaults trap the caret inside blockquotes):
+   * - Enter → new normal paragraph; on an empty line inside a quote it
+   *   climbs OUT of the quote instead — never trapped.
+   * - Shift+Enter → soft line break.
+   * Ctrl/Cmd+Enter falls through to the global send shortcut.
+   */
+  function onEditorKeydown(e: KeyboardEvent) {
+    if (e.key !== 'Enter' || e.ctrlKey || e.metaKey) return
+    e.preventDefault()
+    markDirty()
+    if (e.shiftKey) {
+      document.execCommand('insertLineBreak')
+      return
+    }
+    if (closestTag('BLOCKQUOTE') && caretBlockIsEmpty()) {
+      exitBlockquote()
+      return
+    }
+    document.execCommand('insertParagraph')
+    // WebKit inserts <div> outside lists/quotes; normalize to <p>.
+    if (!closestTag('BLOCKQUOTE') && !closestTag('LI')) {
+      document.execCommand('formatBlock', false, 'p')
+    }
+  }
+
+  function exitBlockquote() {
+    // outdent one nesting level at a time until the caret leaves the quote.
+    let guard = 0
+    while (closestTag('BLOCKQUOTE') && guard++ < 8) {
+      document.execCommand('outdent')
+    }
+    document.execCommand('formatBlock', false, 'p')
+  }
+
+  function toggleQuote() {
+    if (closestTag('BLOCKQUOTE')) {
+      exitBlockquote()
+    } else {
+      document.execCommand('formatBlock', false, 'blockquote')
+    }
+    bodyEl?.focus()
+    markDirty()
+  }
+
   function togglePlainText() {
     if (!plainText) {
       textBody = bodyEl?.innerText ?? ''
@@ -290,7 +358,7 @@
       <button class="sp-btn" onclick={() => exec('insertUnorderedList')} title="Bullet list"><List size={13} /></button>
       <button class="sp-btn" onclick={() => exec('insertOrderedList')} title="Numbered list"><ListOrdered size={13} /></button>
       <button class="sp-btn" onclick={addLink} title="Link"><Link size={13} /></button>
-      <button class="sp-btn" onclick={() => exec('formatBlock', 'blockquote')} title="Quote"><Quote size={13} /></button>
+      <button class="sp-btn" onclick={toggleQuote} title="Quote (toggles)"><Quote size={13} /></button>
     {/if}
     <span class="spacer"></span>
     <button class="sp-btn" onclick={togglePlainText} title="Toggle plain text">
@@ -318,6 +386,7 @@
       contenteditable="true"
       bind:this={bodyEl}
       oninput={markDirty}
+      onkeydown={onEditorKeydown}
       role="textbox"
       aria-multiline="true"
       aria-label="Message body"

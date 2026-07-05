@@ -86,6 +86,15 @@ Manager), never on disk.
   limitation: Outlook's roaming signatures are not exposed to third-party
   clients at all.
 
+## Linux notes
+
+WebKitGTK's accelerated compositing is crash-prone on some driver and
+compositor combinations (the `WebKitWebProcess` dies and the window goes
+blank). Spite sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` automatically at
+startup — you only need to export it yourself if you launch the webview
+through some other harness, and you can override the behavior by setting
+the variable to `0` before launching.
+
 ## Roadmap (v0.1)
 
 - [x] Phase 0 — Tauri 2 scaffold
