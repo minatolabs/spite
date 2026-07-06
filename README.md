@@ -123,7 +123,7 @@ the variable to `0` before launching.
 - [x] Phase 3 — Graph delta sync
 - [x] Phase 4 — read UI (offline-capable list + message view)
 - [ ] Phase 5 — compose + send
-- [ ] Phase 6 — local full-text search (FTS5)
+- [x] Phase 6 — local full-text search (FTS5)
 
 ## License
 
