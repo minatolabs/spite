@@ -7,7 +7,7 @@ use spite_core::auth::{Account, Authenticator, DeviceCodePrompt};
 use spite_core::compose::{self, ComposeMode, Draft, EmailAddress};
 use spite_core::config::AppConfig;
 use spite_core::graph::{DraftHandle, GraphMailSource, ServerHit};
-use spite_core::ops::{execute_op, MailOp};
+use spite_core::ops::{execute_batch, execute_op, MailOp};
 use spite_core::sanitize::sanitize_html;
 use spite_core::store::{
     build_kql, Folder, MailStore, MailStoreError, Message, MessageSummary, SavedSearch,
@@ -63,9 +63,11 @@ struct SendResultEvent {
 /// out a countdown here, exactly like `SendQueue`. Each entry keeps the
 /// pre-op message snapshot so Undo (or a failed Graph call on lapse) can
 /// restore the optimistic local change. Claim-by-remove is cancellation.
+/// One queue entry = one whole action (a single op is a 1-element vec, a bulk
+/// action is N). Each item pairs its op with the pre-op snapshot for rollback.
 #[derive(Default)]
 struct OpQueue {
-    pending: Mutex<HashMap<u64, (MailOp, Box<Message>)>>,
+    pending: Mutex<HashMap<u64, Vec<(MailOp, Message)>>>,
     next_id: std::sync::atomic::AtomicU64,
 }
 
@@ -721,9 +723,7 @@ async fn apply_op(
         .map_err(|e| e.to_string())
 }
 
-/// Undoable op (archive/move/soft-delete/hard-delete): apply locally now,
-/// show the undo toast, fire Graph on lapse. Undo reverts. Mirrors the
-/// undo-send flow.
+/// Single undoable op — a thin wrapper over the bulk path with a 1-op vec.
 #[tauri::command]
 async fn queue_op(
     app: AppHandle,
@@ -733,34 +733,78 @@ async fn queue_op(
     store: State<'_, Arc<dyn MailStore>>,
     config: State<'_, AppConfig>,
 ) -> Result<(), String> {
-    let msg_id = op.message_id().to_string();
-    let snapshot = {
-        let id = msg_id.clone();
-        store_call(&store, move |s| s.get_message(&id)).await?
-    }
-    .ok_or_else(|| "message not found".to_string())?;
+    queue_items(
+        &app,
+        vec![op],
+        label,
+        &queue,
+        &store,
+        config.undo_send_seconds,
+    )
+    .await
+}
 
-    // Optimistic local apply so the row leaves the list immediately.
-    apply_op_locally(&store, &op, &snapshot).await?;
+/// Bulk undoable action: apply every op locally now, show ONE undo toast, and
+/// fire a single deferred `$batch` on lapse. Nothing hits Graph during the
+/// window; Undo cancels every chunk before any fires.
+#[tauri::command]
+async fn queue_bulk_op(
+    app: AppHandle,
+    ops: Vec<MailOp>,
+    label: String,
+    queue: State<'_, Arc<OpQueue>>,
+    store: State<'_, Arc<dyn MailStore>>,
+    config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    queue_items(&app, ops, label, &queue, &store, config.undo_send_seconds).await
+}
+
+async fn queue_items(
+    app: &AppHandle,
+    ops: Vec<MailOp>,
+    label: String,
+    queue: &Arc<OpQueue>,
+    store: &Arc<dyn MailStore>,
+    undo_seconds: u32,
+) -> Result<(), String> {
+    // Snapshot + optimistically apply each op to the store, so a repaint
+    // during the undo window already shows the change.
+    let mut items: Vec<(MailOp, Message)> = Vec::with_capacity(ops.len());
+    for op in ops {
+        let id = op.message_id().to_string();
+        let snapshot = store_call(store, move |s| s.get_message(&id)).await?;
+        let Some(snapshot) = snapshot else { continue };
+        apply_op_locally(store, &op).await?;
+        items.push((op, snapshot));
+    }
+    if items.is_empty() {
+        return Err("no messages found".to_string());
+    }
+
+    let count = items.len();
+    let subject = if count == 1 {
+        items[0].1.summary.subject.clone()
+    } else {
+        format!("{count} messages")
+    };
 
     let id = queue
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let delay = config.undo_send_seconds.min(120);
+    let delay = undo_seconds.min(120);
     let _ = app.emit(
         "op:queued",
         &OpQueuedEvent {
             id,
             label,
-            subject: snapshot.summary.subject.clone(),
+            subject,
             deadline_ms: now_ms() + u64::from(delay) * 1000,
         },
     );
-    queue
-        .pending
-        .lock()
-        .unwrap()
-        .insert(id, (op, Box::new(snapshot)));
+    queue.pending.lock().unwrap().insert(id, items);
 
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -772,7 +816,7 @@ async fn queue_op(
     Ok(())
 }
 
-/// Cancel a queued op and restore the optimistic local change.
+/// Cancel a queued action and restore every optimistic local change.
 #[tauri::command]
 async fn undo_op(
     id: u64,
@@ -780,86 +824,60 @@ async fn undo_op(
     store: State<'_, Arc<dyn MailStore>>,
 ) -> Result<(), String> {
     let entry = queue.pending.lock().unwrap().remove(&id);
-    let Some((_, snapshot)) = entry else {
+    let Some(items) = entry else {
         return Err("too late — already applied".to_string());
     };
-    store_call(&store, move |s| s.upsert_messages(&[*snapshot])).await
+    let snapshots: Vec<Message> = items.into_iter().map(|(_, m)| m).collect();
+    store_call(&store, move |s| s.upsert_messages(&snapshots)).await
 }
 
-/// Apply an op's local mutation (used both for the optimistic queue apply and
-/// nowhere else — the immediate path goes through `execute_op`).
-async fn apply_op_locally(
-    store: &Arc<dyn MailStore>,
-    op: &MailOp,
-    _snapshot: &Message,
-) -> Result<(), String> {
-    match op {
-        MailOp::Move { id, dest_folder_id } => {
-            let (id, dest) = (id.clone(), dest_folder_id.clone());
-            store_call(store, move |s| s.move_message(&id, &dest, None)).await
+/// Apply one op's local mutation to the store (optimistic).
+async fn apply_op_locally(store: &Arc<dyn MailStore>, op: &MailOp) -> Result<(), String> {
+    let op = op.clone();
+    store_call(store, move |s| match &op {
+        MailOp::SetRead { id, is_read } => s.set_read_state(id, *is_read),
+        MailOp::SetFlag { id, flagged } => {
+            s.set_flag_status(id, if *flagged { "flagged" } else { "notFlagged" })
         }
-        MailOp::HardDelete { id } => {
-            let id = id.clone();
-            store_call(store, move |s| s.delete_message(&id)).await
+        MailOp::SetCategories { id, categories } => s.set_categories(id, categories),
+        MailOp::SetInference { id, focused } => {
+            s.set_inference(id, if *focused { "focused" } else { "other" })
         }
-        // Only move/delete are ever queued; others go through apply_op.
-        _ => Ok(()),
-    }
+        MailOp::Move { id, dest_folder_id } => s.move_message(id, dest_folder_id, None),
+        MailOp::HardDelete { id } => s.delete_message(id),
+    })
+    .await
 }
 
-/// Fire a queued op's Graph call on lapse; roll back the local change on
-/// failure. Claim-by-remove: a missing entry was undone.
+/// On lapse, send the whole action as one (chunked) `$batch` and reconcile
+/// per item. Claim-by-remove: a missing entry was undone → no chunk fires.
 async fn perform_op(app: &AppHandle, id: u64) {
-    let queue = app.state::<Arc<OpQueue>>();
-    let Some((op, snapshot)) = queue.pending.lock().unwrap().remove(&id) else {
+    let Some(items) = app
+        .state::<Arc<OpQueue>>()
+        .pending
+        .lock()
+        .unwrap()
+        .remove(&id)
+    else {
         return;
     };
-    let auth = Arc::clone(&app.state::<Arc<Authenticator>>());
     let store = Arc::clone(&app.state::<Arc<dyn MailStore>>());
-    let writer = GraphMailSource::new(auth);
+    let writer = GraphMailSource::new(Arc::clone(&app.state::<Arc<Authenticator>>()));
 
-    // The local change is already applied; call Graph and reconcile.
-    let result = call_writer_for_queued(&writer, &store, &op).await;
-    match result {
-        Ok(()) => {
-            let _ = app.emit("op:done", &SendResultEvent { id, error: None });
-        }
-        Err(e) => {
-            // Restore the optimistic change.
-            let _ = store_call(&store, move |s| s.upsert_messages(&[*snapshot])).await;
-            let _ = app.emit(
-                "op:done",
-                &SendResultEvent {
-                    id,
-                    error: Some(e.clone()),
-                },
-            );
-            tracing::warn!(error = %e, "queued op failed; rolled back");
-        }
-    }
-}
-
-async fn call_writer_for_queued(
-    writer: &GraphMailSource,
-    store: &Arc<dyn MailStore>,
-    op: &MailOp,
-) -> Result<(), String> {
-    use spite_core::ops::MailWriter;
-    match op {
-        MailOp::Move { id, dest_folder_id } => {
-            let new_id = writer
-                .move_message(id, dest_folder_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            // Reconcile the local row to the destination copy's new id.
-            let (id, dest) = (id.clone(), dest_folder_id.clone());
-            store_call(store, move |s| s.move_message(&id, &dest, Some(&new_id)))
-                .await
-                .map(|_| ())
-        }
-        MailOp::HardDelete { id } => writer.delete_message(id).await.map_err(|e| e.to_string()),
-        _ => Ok(()),
-    }
+    let total = items.len();
+    let outcome = execute_batch(&store, &writer, items).await;
+    let failed = outcome.failed_count();
+    let error = if failed == 0 {
+        None
+    } else {
+        tracing::warn!(
+            failed,
+            total,
+            "bulk op partially failed; failures rolled back"
+        );
+        Some(format!("{failed} of {total} couldn't be completed"))
+    };
+    let _ = app.emit("op:done", &SendResultEvent { id, error });
 }
 
 // --- Drafts (createReply/createForward/blank) ---
@@ -1071,6 +1089,7 @@ pub fn run() {
             get_keymap,
             apply_op,
             queue_op,
+            queue_bulk_op,
             undo_op,
             create_reply_draft,
             create_blank_draft,

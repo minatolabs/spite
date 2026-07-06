@@ -1,8 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
-  import { Archive, Flag, Forward, MailOpen, Reply, Trash2 } from 'lucide-svelte'
-  import { archive, mail, softDelete, toggleFlag, toggleRead } from './mail.svelte'
+  import { Archive, Flag, FolderInput, Forward, MailOpen, Reply, Trash2 } from 'lucide-svelte'
+  import { archive, mail, moveToFolder, softDelete, toggleFlag, toggleRead } from './mail.svelte'
+  import FolderPicker from './FolderPicker.svelte'
+
+  let showPicker = $state(false)
+  let pickerFor: string | null = $state(null)
 
   let open = $state(false)
   let x = $state(0)
@@ -91,10 +95,35 @@
     <button role="menuitem" onclick={() => act((id) => void archive(id))}>
       <Archive size={13} /> Archive
     </button>
+    <button
+      role="menuitem"
+      onclick={() =>
+        act((id) => {
+          pickerFor = id
+          showPicker = true
+        })}
+    >
+      <FolderInput size={13} /> Move to…
+    </button>
     <button role="menuitem" class="danger" onclick={() => act((id) => void softDelete(id))}>
       <Trash2 size={13} /> Delete
     </button>
   </div>
+{/if}
+
+{#if showPicker && pickerFor}
+  <FolderPicker
+    onpick={(dest) => {
+      const id = pickerFor
+      showPicker = false
+      pickerFor = null
+      if (id) void moveToFolder(id, dest)
+    }}
+    onclose={() => {
+      showPicker = false
+      pickerFor = null
+    }}
+  />
 {/if}
 
 <style>

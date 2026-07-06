@@ -3,6 +3,7 @@
   import { invoke } from '@tauri-apps/api/core'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { LogOut, PenLine, RefreshCw, Settings2 } from 'lucide-svelte'
+  import BulkBar from './BulkBar.svelte'
   import FilterChips from './FilterChips.svelte'
   import FolderTree from './FolderTree.svelte'
   import MailContextMenu from './MailContextMenu.svelte'
@@ -15,9 +16,11 @@
   import {
     archive,
     clearSearch,
+    clearSelection,
     initMail,
     mail,
     searchActive,
+    selectAll,
     selectedFolder,
     softDelete,
     syncNow,
@@ -77,8 +80,20 @@
   }
 
   function onGlobalKeydown(e: KeyboardEvent) {
+    // Ctrl/Cmd+A selects all visible messages (outside inputs).
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && !isTyping(e.target)) {
+      e.preventDefault()
+      selectAll()
+      return
+    }
     if (e.ctrlKey || e.metaKey || e.altKey || isTyping(e.target)) return
     const key = e.key
+    // Esc clears an active multi-selection first.
+    if (key === 'Escape' && mail.selection.size > 0) {
+      e.preventDefault()
+      clearSelection()
+      return
+    }
     if (key === keymap.focusSearch) {
       e.preventDefault()
       document.getElementById('search-input')?.focus()
@@ -193,7 +208,11 @@
       <FolderTree />
     </aside>
     <section class="list-pane">
-      <FilterChips />
+      {#if mail.selection.size > 0}
+        <BulkBar />
+      {:else}
+        <FilterChips />
+      {/if}
       <div class="list sp-scroll">
         <MessageList />
       </div>

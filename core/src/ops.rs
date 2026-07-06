@@ -294,6 +294,205 @@ async fn rollback_local(store: &Arc<dyn MailStore>, rb: Rollback) -> Result<(), 
     Ok(())
 }
 
+// ============================================================================
+// Bulk operations via Microsoft Graph JSON batching (POST /$batch).
+// ============================================================================
+
+/// One sub-request inside a `$batch`. `index` is its position in the input
+/// op list and doubles as the batch correlation `id`.
+#[derive(Debug, Clone)]
+pub struct BatchSub {
+    pub index: usize,
+    pub method: &'static str,
+    /// Relative Graph URL, e.g. `/me/messages/{id}/move`.
+    pub url: String,
+    pub body: Option<serde_json::Value>,
+}
+
+/// The per-sub-request result the writer hands back, correlated by `index`.
+#[derive(Debug, Clone)]
+pub struct SubResult {
+    pub index: usize,
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
+/// The Graph `$batch` surface. One call sends ONE chunk (≤20). Implemented by
+/// `graph::GraphMailSource`; mocked in tests. A transport-level failure is an
+/// `Err`; per-item HTTP failures come back as non-2xx `SubResult`s.
+pub trait MailBatchWriter: Send + Sync {
+    fn execute_chunk(
+        &self,
+        subs: &[BatchSub],
+    ) -> impl Future<Output = Result<Vec<SubResult>, SourceError>> + Send;
+}
+
+pub const BATCH_CHUNK: usize = 20;
+
+/// Build the `$batch` sub-request for a single op.
+pub fn op_to_sub(index: usize, op: &MailOp) -> BatchSub {
+    match op {
+        MailOp::SetRead { id, is_read } => BatchSub {
+            index,
+            method: "PATCH",
+            url: format!("/me/messages/{id}"),
+            body: Some(serde_json::json!({ "isRead": is_read })),
+        },
+        MailOp::SetFlag { id, flagged } => BatchSub {
+            index,
+            method: "PATCH",
+            url: format!("/me/messages/{id}"),
+            body: Some(serde_json::json!({
+                "flag": { "flagStatus": if *flagged { "flagged" } else { "notFlagged" } }
+            })),
+        },
+        MailOp::SetCategories { id, categories } => BatchSub {
+            index,
+            method: "PATCH",
+            url: format!("/me/messages/{id}"),
+            body: Some(serde_json::json!({ "categories": categories })),
+        },
+        MailOp::SetInference { id, focused } => BatchSub {
+            index,
+            method: "PATCH",
+            url: format!("/me/messages/{id}"),
+            body: Some(serde_json::json!({
+                "inferenceClassification": if *focused { "focused" } else { "other" }
+            })),
+        },
+        MailOp::Move { id, dest_folder_id } => BatchSub {
+            index,
+            method: "POST",
+            url: format!("/me/messages/{id}/move"),
+            body: Some(serde_json::json!({ "destinationId": dest_folder_id })),
+        },
+        MailOp::HardDelete { id } => BatchSub {
+            index,
+            method: "DELETE",
+            url: format!("/me/messages/{id}"),
+            body: None,
+        },
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ItemOutcome {
+    pub id: String,
+    /// Set when a move reconciled to the destination copy's new id.
+    pub new_id: Option<String>,
+    /// `None` = confirmed by the server; `Some` = failed and rolled back.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BatchOutcome {
+    /// One per input op, in input order.
+    pub outcomes: Vec<ItemOutcome>,
+}
+
+impl BatchOutcome {
+    pub fn failed_ids(&self) -> Vec<String> {
+        self.outcomes
+            .iter()
+            .filter(|o| o.error.is_some())
+            .map(|o| o.id.clone())
+            .collect()
+    }
+    pub fn failed_count(&self) -> usize {
+        self.outcomes.iter().filter(|o| o.error.is_some()).count()
+    }
+}
+
+/// Run a bulk action already applied optimistically to the store. `items`
+/// pairs each op with the pre-op message snapshot for rollback. Sends in
+/// ≤20 chunks; on **per-item** failure restores only that item's snapshot,
+/// on move success reconciles the destination id, and leaves every confirmed
+/// sibling applied. A whole-chunk transport error rolls back that chunk and
+/// every not-yet-sent item — nothing stays applied without a 2xx.
+pub async fn execute_batch(
+    store: &Arc<dyn MailStore>,
+    writer: &impl MailBatchWriter,
+    items: Vec<(MailOp, Message)>,
+) -> BatchOutcome {
+    let mut outcomes: Vec<ItemOutcome> = items
+        .iter()
+        .map(|(op, _)| ItemOutcome {
+            id: op.message_id().to_string(),
+            new_id: None,
+            error: None,
+        })
+        .collect();
+
+    let mut chunk_start = 0;
+    while chunk_start < items.len() {
+        let chunk_end = (chunk_start + BATCH_CHUNK).min(items.len());
+        let subs: Vec<BatchSub> = (chunk_start..chunk_end)
+            .map(|i| op_to_sub(i, &items[i].0))
+            .collect();
+
+        match writer.execute_chunk(&subs).await {
+            Ok(results) => {
+                for i in chunk_start..chunk_end {
+                    match results.iter().find(|r| r.index == i) {
+                        Some(r) if (200..300).contains(&r.status) => {
+                            if let MailOp::Move { id, dest_folder_id } = &items[i].0 {
+                                // Reconcile to the destination copy's new id.
+                                let new_id = r
+                                    .body
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string);
+                                if let Some(nid) = &new_id {
+                                    let (id, dest, nid) =
+                                        (id.clone(), dest_folder_id.clone(), nid.clone());
+                                    let _ = store_call(store, move |s| {
+                                        s.move_message(&id, &dest, Some(&nid))
+                                    })
+                                    .await;
+                                }
+                                outcomes[i].new_id = new_id;
+                            }
+                        }
+                        other => {
+                            // Missing response or non-2xx → roll back just this item.
+                            let msg = match other {
+                                Some(r) => format!(
+                                    "{}: {}",
+                                    r.status,
+                                    r.body
+                                        .pointer("/error/message")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("request failed")
+                                ),
+                                None => "no response in batch".to_string(),
+                            };
+                            restore_snapshot(store, items[i].1.clone()).await;
+                            outcomes[i].error = Some(msg);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Whole-chunk transport failure: roll back this chunk AND every
+                // not-yet-sent item, then stop.
+                let msg = e.to_string();
+                for (i, item) in items.iter().enumerate().skip(chunk_start) {
+                    restore_snapshot(store, item.1.clone()).await;
+                    outcomes[i].error = Some(msg.clone());
+                }
+                break;
+            }
+        }
+        chunk_start = chunk_end;
+    }
+
+    BatchOutcome { outcomes }
+}
+
+async fn restore_snapshot(store: &Arc<dyn MailStore>, snapshot: Message) {
+    let _ = store_call(store, move |s| s.upsert_messages(&[snapshot])).await;
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -388,6 +587,226 @@ mod tests {
             }])
             .unwrap();
         Arc::new(store)
+    }
+
+    fn msg(id: &str, folder: &str) -> Message {
+        Message {
+            summary: MessageSummary {
+                id: id.into(),
+                folder_id: folder.into(),
+                subject: format!("subject {id}"),
+                from_name: "A".into(),
+                from_address: "a@x.com".into(),
+                received_at: 100,
+                preview: "hi".into(),
+                is_read: false,
+                has_attachments: false,
+                flag_status: "notFlagged".into(),
+                inference_classification: "focused".into(),
+                is_draft: false,
+            },
+            conversation_id: None,
+            body_html: None,
+            body_content_type: None,
+            internet_message_id: Some(format!("{id}@x")),
+            categories: vec![],
+        }
+    }
+
+    fn store_with_messages(ids: &[&str]) -> Arc<dyn MailStore> {
+        let store = MemoryMailStore::default();
+        store
+            .upsert_folders(&[
+                Folder {
+                    id: "inbox".into(),
+                    display_name: "Inbox".into(),
+                    well_known_name: Some("inbox".into()),
+                    parent_id: None,
+                },
+                Folder {
+                    id: "archive".into(),
+                    display_name: "Archive".into(),
+                    well_known_name: Some("archive".into()),
+                    parent_id: None,
+                },
+            ])
+            .unwrap();
+        let msgs: Vec<Message> = ids.iter().map(|id| msg(id, "inbox")).collect();
+        store.upsert_messages(&msgs).unwrap();
+        Arc::new(store)
+    }
+
+    /// Scripted batch writer: a per-index status/body function + a counter of
+    /// how many chunks it was asked to send.
+    struct MockMailBatchWriter {
+        script: Box<dyn Fn(&BatchSub) -> SubResult + Send + Sync>,
+        chunk_calls: Mutex<usize>,
+        transport_fail: bool,
+    }
+    impl MockMailBatchWriter {
+        fn new(f: impl Fn(&BatchSub) -> SubResult + Send + Sync + 'static) -> Self {
+            Self {
+                script: Box::new(f),
+                chunk_calls: Mutex::new(0),
+                transport_fail: false,
+            }
+        }
+        fn transport_failing() -> Self {
+            Self {
+                script: Box::new(|s| SubResult {
+                    index: s.index,
+                    status: 200,
+                    body: serde_json::json!({}),
+                }),
+                chunk_calls: Mutex::new(0),
+                transport_fail: true,
+            }
+        }
+    }
+    impl MailBatchWriter for MockMailBatchWriter {
+        async fn execute_chunk(&self, subs: &[BatchSub]) -> Result<Vec<SubResult>, SourceError> {
+            *self.chunk_calls.lock().unwrap() += 1;
+            if self.transport_fail {
+                return Err(SourceError::Http("network down".into()));
+            }
+            Ok(subs.iter().map(|s| (self.script)(s)).collect())
+        }
+    }
+
+    /// Apply a move optimistically (as the shell does before the batch fires)
+    /// and return the pre-op snapshot for rollback.
+    async fn apply_move(store: &Arc<dyn MailStore>, id: &str, dest: &str) -> (MailOp, Message) {
+        let snapshot = store.get_message(id).unwrap().unwrap();
+        store.move_message(id, dest, None).unwrap();
+        (
+            MailOp::Move {
+                id: id.into(),
+                dest_folder_id: dest.into(),
+            },
+            snapshot,
+        )
+    }
+
+    #[tokio::test]
+    async fn batch_partial_failure_rolls_back_only_failed_items() {
+        let store = store_with_messages(&["m1", "m2", "m3"]);
+        let items = vec![
+            apply_move(&store, "m1", "archive").await,
+            apply_move(&store, "m2", "archive").await,
+            apply_move(&store, "m3", "archive").await,
+        ];
+        // Server accepts m1 (index 0) and m3 (index 2); rejects m2 (index 1).
+        let writer = MockMailBatchWriter::new(|s| {
+            if s.index == 1 {
+                SubResult {
+                    index: 1,
+                    status: 403,
+                    body: serde_json::json!({ "error": { "message": "quota exceeded" } }),
+                }
+            } else {
+                SubResult {
+                    index: s.index,
+                    status: 201,
+                    body: serde_json::json!({ "id": format!("moved-{}", s.index) }),
+                }
+            }
+        });
+
+        let out = execute_batch(&store, &writer, items).await;
+
+        // m1 & m3 left the source and carry reconciled ids.
+        assert!(store.get_message("m1").unwrap().is_none());
+        assert_eq!(
+            store
+                .get_message("moved-0")
+                .unwrap()
+                .unwrap()
+                .summary
+                .folder_id,
+            "archive"
+        );
+        assert!(store.get_message("moved-2").unwrap().is_some());
+        // m2 rolled back: still present, original id, original folder.
+        let m2 = store.get_message("m2").unwrap().unwrap();
+        assert_eq!(m2.summary.folder_id, "inbox");
+        // Only m2 reported failed.
+        assert_eq!(out.failed_ids(), ["m2"]);
+        assert_eq!(out.failed_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_chunks_selections_over_twenty() {
+        let ids: Vec<String> = (0..25).map(|i| format!("m{i}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let store = store_with_messages(&id_refs);
+        let mut items = Vec::new();
+        for id in &ids {
+            items.push(apply_move(&store, id, "archive").await);
+        }
+        let writer = MockMailBatchWriter::new(|s| SubResult {
+            index: s.index,
+            status: 201,
+            body: serde_json::json!({ "id": format!("a-{}", s.index) }),
+        });
+
+        let out = execute_batch(&store, &writer, items).await;
+
+        // 25 items → exactly two chunks (20 + 5); all succeeded, none failed.
+        assert_eq!(*writer.chunk_calls.lock().unwrap(), 2);
+        assert_eq!(out.failed_count(), 0);
+        assert!(store.get_message("a-24").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn batch_transport_failure_rolls_back_everything() {
+        let store = store_with_messages(&["m1", "m2"]);
+        let items = vec![
+            apply_move(&store, "m1", "archive").await,
+            apply_move(&store, "m2", "archive").await,
+        ];
+        let writer = MockMailBatchWriter::transport_failing();
+
+        let out = execute_batch(&store, &writer, items).await;
+
+        assert_eq!(out.failed_count(), 2);
+        // Both restored to the inbox.
+        assert_eq!(
+            store.get_message("m1").unwrap().unwrap().summary.folder_id,
+            "inbox"
+        );
+        assert_eq!(
+            store.get_message("m2").unwrap().unwrap().summary.folder_id,
+            "inbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_mixed_ops_reconcile_and_apply() {
+        let store = store_with_messages(&["m1", "m2"]);
+        // m1: mark read (patch); m2: move.
+        let read_snap = store.get_message("m1").unwrap().unwrap();
+        store.set_read_state("m1", true).unwrap();
+        let move_item = apply_move(&store, "m2", "archive").await;
+        let items = vec![
+            (
+                MailOp::SetRead {
+                    id: "m1".into(),
+                    is_read: true,
+                },
+                read_snap,
+            ),
+            move_item,
+        ];
+        let writer = MockMailBatchWriter::new(|s| SubResult {
+            index: s.index,
+            status: 200,
+            body: serde_json::json!({ "id": "m2-moved" }),
+        });
+
+        let out = execute_batch(&store, &writer, items).await;
+        assert_eq!(out.failed_count(), 0);
+        assert!(store.get_message("m1").unwrap().unwrap().summary.is_read);
+        assert!(store.get_message("m2-moved").unwrap().is_some());
     }
 
     #[tokio::test]

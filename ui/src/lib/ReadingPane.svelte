@@ -3,6 +3,7 @@
   import {
     Archive,
     Flag,
+    FolderInput,
     Forward,
     ImageOff,
     Inbox,
@@ -17,6 +18,7 @@
   import {
     archive,
     mail,
+    moveToFolder,
     setCategories,
     setFocused,
     softDelete,
@@ -25,6 +27,9 @@
     type Message,
     type MessageBody,
   } from './mail.svelte'
+  import FolderPicker from './FolderPicker.svelte'
+
+  let showMovePicker = $state(false)
 
   let addingCategory = $state(false)
   let newCategory = $state('')
@@ -252,6 +257,9 @@
           >
             <Trash2 size={13} />
           </button>
+          <button class="sp-btn" onclick={() => (showMovePicker = true)} title="Move to folder">
+            <FolderInput size={13} /> Move
+          </button>
           {#if message.summary.inference_classification === 'other'}
             <button class="sp-btn" onclick={() => focusMove(true)}>
               <Inbox size={13} /> Move to Focused
@@ -319,6 +327,20 @@
       {/if}
     </div>
   </article>
+{/if}
+
+{#if showMovePicker && message}
+  <FolderPicker
+    excludeId={message.summary.folder_id}
+    onpick={(dest) => {
+      showMovePicker = false
+      if (message) {
+        void moveToFolder(message.summary.id, dest)
+        afterListChange()
+      }
+    }}
+    onclose={() => (showMovePicker = false)}
+  />
 {/if}
 
 <style>

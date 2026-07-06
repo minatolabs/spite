@@ -1,6 +1,14 @@
 <script lang="ts">
   import { CloudDownload, Flag } from 'lucide-svelte'
-  import { loadMore, mail, searchActive, selectedFolder, type MessageSummary } from './mail.svelte'
+  import {
+    clickSelect,
+    isSelected,
+    loadMore,
+    mail,
+    searchActive,
+    selectedFolder,
+    type MessageSummary,
+  } from './mail.svelte'
 
   // Focused/Other tabs apply only to the Inbox browse view.
   let showFocusTabs = $derived(!searchActive() && selectedFolder()?.well_known_name === 'inbox')
@@ -23,14 +31,22 @@
     return out
   }
 
-  function selectLocal(id: string) {
-    mail.serverSelected = null
-    mail.selectedId = id
+  function rowClick(id: string, e: MouseEvent | KeyboardEvent) {
+    // Ctrl/Cmd/Shift = multi-select; plain click = single-select + open.
+    clickSelect(id, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey })
   }
 
   function selectServer(summary: MessageSummary) {
     mail.serverSelected = summary
     mail.selectedId = summary.id
+  }
+
+  // Drag payload: the whole selection if the dragged row is part of it, else
+  // just that row. Consumed by FolderTree drop targets.
+  function onDragStart(id: string, e: DragEvent) {
+    const ids = isSelected(id) && mail.selection.size > 1 ? [...mail.selection] : [id]
+    e.dataTransfer?.setData('application/x-spite-messages', JSON.stringify(ids))
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
   }
 
   function fmtTime(epoch: number): string {
@@ -61,7 +77,7 @@
         class:unread={s ? !s.is_read : false}
         class:selected={hit.entity_id === mail.selectedId}
         data-message-id={s ? s.id : undefined}
-        onclick={() => s && selectLocal(s.id)}
+        onclick={(e) => s && rowClick(s.id, e)}
       >
         <span class="top">
           {#if s}
@@ -128,27 +144,52 @@
         >
       </div>
     {/if}
+    {#if mail.folderLoading}
+      <p class="empty">Loading {selectedFolder()?.display_name ?? 'folder'}…</p>
+    {/if}
     {#each browseRows as m (m.id)}
-      <button
-        class="row"
+      <div
+        class="row browse"
         class:unread={!m.is_read}
         class:selected={m.id === mail.selectedId}
+        class:multi={isSelected(m.id)}
         data-message-id={m.id}
-        onclick={() => selectLocal(m.id)}
+        role="button"
+        tabindex="0"
+        draggable="true"
+        ondragstart={(e) => onDragStart(m.id, e)}
+        onclick={(e) => rowClick(m.id, e)}
+        onkeydown={(e) => e.key === 'Enter' && rowClick(m.id, e)}
       >
-        <span class="top">
-          <span class="sp-led" class:sp-led--off={m.is_read}></span>
-          <span class="from">{m.from_name || m.from_address || '(unknown sender)'}</span>
-          {#if m.flag_status === 'flagged'}<Flag size={11} class="flag" />{/if}
-          <span class="time">{fmtTime(m.received_at)}</span>
-        </span>
-        <span class="subject">{m.subject || '(no subject)'}</span>
-        <span class="preview">{m.preview}</span>
-      </button>
+        <input
+          class="check"
+          type="checkbox"
+          checked={isSelected(m.id)}
+          onclick={(e) => {
+            e.stopPropagation()
+            clickSelect(m.id, { ctrl: true })
+          }}
+          aria-label="Select message"
+        />
+        <div class="row-body">
+          <span class="top">
+            <span class="sp-led" class:sp-led--off={m.is_read}></span>
+            <span class="from">{m.from_name || m.from_address || '(unknown sender)'}</span>
+            {#if m.flag_status === 'flagged'}<Flag size={11} class="flag" />{/if}
+            <span class="time">{fmtTime(m.received_at)}</span>
+          </span>
+          <span class="subject">{m.subject || '(no subject)'}</span>
+          <span class="preview">{m.preview}</span>
+        </div>
+      </div>
     {:else}
-      <p class="empty">
-        {mail.focusTab === 'all' ? 'No messages in this folder yet.' : `No ${mail.focusTab} messages.`}
-      </p>
+      {#if !mail.folderLoading}
+        <p class="empty">
+          {mail.focusTab === 'all'
+            ? 'No messages in this folder yet.'
+            : `No ${mail.focusTab} messages.`}
+        </p>
+      {/if}
     {/each}
     {#if mail.hasMore && mail.focusTab === 'all'}
       <button class="sp-btn more" onclick={() => void loadMore()}>Load more</button>
@@ -218,6 +259,42 @@
   .row:focus-visible {
     outline: none;
     box-shadow: var(--sp-focus-ring);
+  }
+
+  /* Browse rows carry a checkbox beside a body column and are draggable. */
+  .row.browse {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--sp-2);
+    cursor: grab;
+  }
+
+  .row.browse:active {
+    cursor: grabbing;
+  }
+
+  .row.browse.multi {
+    background: var(--sp-selected-fill);
+  }
+
+  .row-body {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .check {
+    flex: none;
+    accent-color: var(--sp-accent-edge);
+    opacity: 0;
+    transition: opacity var(--sp-dur-fast) var(--sp-ease);
+  }
+
+  .row.browse:hover .check,
+  .row.browse.multi .check {
+    opacity: 1;
   }
 
   .top {

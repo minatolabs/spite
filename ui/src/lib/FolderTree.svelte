@@ -8,7 +8,32 @@
     ShieldAlert,
     Trash2,
   } from 'lucide-svelte'
-  import { mail, selectFolder, type Folder } from './mail.svelte'
+  import { mail, moveToFolder, selectFolder, type Folder } from './mail.svelte'
+
+  // Drop-target highlight (drag messages from the list onto a folder).
+  let dropTargetId: string | null = $state(null)
+
+  function onDragOver(folderId: string, e: DragEvent) {
+    if (!e.dataTransfer?.types.includes('application/x-spite-messages')) return
+    if (folderId === mail.folderId) return // no-op onto the source folder
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    dropTargetId = folderId
+  }
+
+  function onDrop(folderId: string, e: DragEvent) {
+    dropTargetId = null
+    const raw = e.dataTransfer?.getData('application/x-spite-messages')
+    if (!raw || folderId === mail.folderId) return
+    e.preventDefault()
+    let ids: string[]
+    try {
+      ids = JSON.parse(raw)
+    } catch {
+      return
+    }
+    for (const id of ids) void moveToFolder(id, folderId)
+  }
 
   const wellKnownOrder = ['inbox', 'sentitems', 'drafts', 'archive', 'junkemail', 'deleteditems']
   const icons: Record<string, typeof Inbox> = {
@@ -43,7 +68,11 @@
     <button
       class="folder"
       class:selected={folder.id === mail.folderId}
+      class:drop-target={dropTargetId === folder.id}
       onclick={() => void selectFolder(folder.id)}
+      ondragover={(e) => onDragOver(folder.id, e)}
+      ondragleave={() => (dropTargetId = null)}
+      ondrop={(e) => onDrop(folder.id, e)}
     >
       <Icon size={14} />
       <span class="name">{labels[folder.well_known_name ?? ''] ?? folder.display_name}</span>
@@ -59,7 +88,11 @@
       <button
         class="folder"
         class:selected={folder.id === mail.folderId}
+        class:drop-target={dropTargetId === folder.id}
         onclick={() => void selectFolder(folder.id)}
+        ondragover={(e) => onDragOver(folder.id, e)}
+        ondragleave={() => (dropTargetId = null)}
+        ondrop={(e) => onDrop(folder.id, e)}
       >
         <FolderIcon size={14} />
         <span class="name">{folder.display_name}</span>
@@ -106,6 +139,14 @@
   .folder.selected {
     background: var(--sp-selected-fill);
     border-left-color: var(--sp-accent-edge);
+    color: var(--sp-text-display);
+  }
+
+  /* Valid drop target while dragging a message over it. */
+  .folder.drop-target {
+    background: var(--sp-accent-bg);
+    border-left-color: var(--sp-accent-edge);
+    box-shadow: inset 0 0 0 1px var(--sp-accent-border);
     color: var(--sp-text-display);
   }
 

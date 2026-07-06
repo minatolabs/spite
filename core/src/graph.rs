@@ -11,7 +11,7 @@ use base64::Engine;
 
 use crate::auth::{AuthError, Authenticator};
 use crate::compose::{parse_references, EmailAddress, ReplyContext};
-use crate::ops::MailWriter;
+use crate::ops::{BatchSub, MailBatchWriter, MailWriter, SubResult};
 use crate::store::{Folder, Message, MessageSummary};
 use crate::sync::{DeltaPage, DeltaRequest, MailSource, PageToken, SourceError};
 
@@ -855,6 +855,64 @@ impl MailWriter for GraphMailSource {
         let url = format!("{GRAPH_BASE}/me/messages/{id}");
         self.send_authed(|| self.http.delete(&url)).await?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchResponses {
+    responses: Vec<BatchResponseItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchResponseItem {
+    /// The correlation id we set (the op's index, as a string).
+    id: String,
+    status: u16,
+    #[serde(default)]
+    body: serde_json::Value,
+}
+
+impl MailBatchWriter for GraphMailSource {
+    /// One JSON `$batch` (≤20 sub-requests). Correlates each response back to
+    /// its op index via the `id` we assigned. A transport/throttle error is
+    /// an `Err` (the caller rolls back the whole chunk); per-item HTTP
+    /// failures ride back as non-2xx `SubResult`s.
+    async fn execute_chunk(&self, subs: &[BatchSub]) -> Result<Vec<SubResult>, SourceError> {
+        let requests: Vec<serde_json::Value> = subs
+            .iter()
+            .map(|s| {
+                let mut req = serde_json::json!({
+                    "id": s.index.to_string(),
+                    "method": s.method,
+                    "url": s.url,
+                });
+                if let Some(body) = &s.body {
+                    req["body"] = body.clone();
+                    req["headers"] = serde_json::json!({ "Content-Type": "application/json" });
+                }
+                req
+            })
+            .collect();
+        let payload = serde_json::json!({ "requests": requests });
+        let url = format!("{GRAPH_BASE}/$batch");
+        let resp = self
+            .send_authed(|| self.http.post(&url).json(&payload))
+            .await?;
+        let parsed: BatchResponses = resp
+            .json()
+            .await
+            .map_err(|e| SourceError::Protocol(e.to_string()))?;
+        Ok(parsed
+            .responses
+            .into_iter()
+            .filter_map(|r| {
+                r.id.parse::<usize>().ok().map(|index| SubResult {
+                    index,
+                    status: r.status,
+                    body: r.body,
+                })
+            })
+            .collect())
     }
 }
 
