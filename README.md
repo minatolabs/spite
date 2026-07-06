@@ -40,8 +40,13 @@ Entra app registration:
    Name it anything; supported accounts: **multitenant** (any organizational
    directory).
 2. Authentication → **Allow public client flows = Yes**. No client secret.
-3. API permissions → Microsoft Graph → Delegated: `Mail.Read`, `Mail.Send`,
-   `User.Read`. (`offline_access` is consented implicitly.)
+3. API permissions → Microsoft Graph → Delegated: `Mail.Read`,
+   `Mail.ReadWrite`, `Mail.Send`, `User.Read`. (`offline_access` is consented
+   implicitly.) `Mail.ReadWrite` is what lets Spite be a real mail client —
+   mark read, flag, move, archive, delete, and true drafts are all writes; a
+   read-only viewer can't do them. If you're upgrading an existing install,
+   add `Mail.ReadWrite` and Spite will prompt for one clean re-consent on the
+   next launch (your account stays connected — it's re-consent, not re-setup).
 4. Copy the **Application (client) ID** into Spite's config file:
 
 ```jsonc
@@ -85,6 +90,28 @@ Manager), never on disk.
   separate new-message and reply variants). This is a Graph platform
   limitation: Outlook's roaming signatures are not exposed to third-party
   clients at all.
+
+## Mail management
+
+- **Optimistic, honest**: mark read/unread, flag, move, archive, delete, and
+  categorize apply to the local store instantly, then commit to Graph in the
+  background. If the server rejects a change it is **rolled back locally** —
+  the UI never shows a state Exchange refused — and the next delta sync
+  reconciles anything that drifted.
+- **Undo window**: archive/move/delete show an undo toast (same countdown as
+  undo-send); the Graph call fires only when it lapses. Delete is a **soft
+  delete** to Deleted Items; permanent delete lives inside Deleted Items
+  behind an explicit confirm.
+- **True drafts**: reply/reply-all/forward create a server draft
+  (`createReply` etc.) that autosaves and is editable across sessions from the
+  Drafts folder. Offline, Spite falls back to building the MIME message
+  locally (with the undo-send window). Attachments up to 150 MB upload via a
+  resumable upload session with progress.
+- **Focused inbox**: Focused/Other tabs on the Inbox, with a per-message
+  override. **Categories**: assign/remove per message (colour management is a
+  later mailbox-settings phase).
+- Keyboard `e` (archive), `#` (delete), `s` (flag) now perform real actions.
+- Scope: this adds exactly `Mail.ReadWrite` — nothing broader.
 
 ## Search
 

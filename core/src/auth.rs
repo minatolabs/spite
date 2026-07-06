@@ -20,10 +20,14 @@ use crate::config::AppConfig;
 use crate::graph;
 use token_store::TokenStore;
 
-/// Delegated Graph scopes. Strict v0.1 set — deliberately no `Mail.ReadWrite`
-/// (no server-side mark-read/drafts/delete in v0.1).
-pub const SCOPES: [&str; 4] = [
+/// Delegated Graph scopes. `Mail.ReadWrite` (Phase 7) is the only scope
+/// escalation since Phase 1 — deliberately nothing broader (no `.Shared`,
+/// no `.All`). Adding it means an existing refresh token no longer covers
+/// the request set, so the next sign-in needs fresh consent (see
+/// `AuthError::ConsentRequired`).
+pub const SCOPES: [&str; 5] = [
     "https://graph.microsoft.com/Mail.Read",
+    "https://graph.microsoft.com/Mail.ReadWrite",
     "https://graph.microsoft.com/Mail.Send",
     "https://graph.microsoft.com/User.Read",
     "offline_access",
@@ -48,6 +52,8 @@ pub enum AuthError {
     NotConfigured,
     #[error("not signed in")]
     NeedsSignIn,
+    #[error("Spite needs permission to manage your mail — sign in again to grant it")]
+    ConsentRequired,
     #[error("identity provider returned no refresh token (offline_access missing?)")]
     NoRefreshToken,
     #[error("keychain error: {0}")]
@@ -210,15 +216,7 @@ impl Authenticator {
             .add_scopes(SCOPES.iter().map(|s| Scope::new((*s).to_string())))
             .request_async(&self.http)
             .await
-            .map_err(|e| match &e {
-                // Revoked/expired refresh token → interactive sign-in again.
-                RequestTokenError::ServerResponse(r)
-                    if matches!(r.error(), BasicErrorResponseType::InvalidGrant) =>
-                {
-                    AuthError::NeedsSignIn
-                }
-                _ => AuthError::OAuth(e.to_string()),
-            })?;
+            .map_err(map_refresh_error)?;
 
         // The IdP may rotate the refresh token; always keep the newest.
         if let Some(rotated) = token.refresh_token() {
@@ -307,15 +305,69 @@ impl Authenticator {
     }
 }
 
+/// Classify a refresh-token exchange failure. A refresh grant can only
+/// request already-consented scopes, so the first silent sign-in after a
+/// scope escalation (Phase 7's `Mail.ReadWrite`) comes back `invalid_grant`
+/// with AADSTS65001 / a `*_required` suberror — that means "re-consent",
+/// distinct from a revoked token which means "sign in again".
+fn map_refresh_error<RE: std::error::Error>(
+    e: RequestTokenError<RE, oauth2::StandardErrorResponse<BasicErrorResponseType>>,
+) -> AuthError {
+    if let RequestTokenError::ServerResponse(r) = &e {
+        if matches!(r.error(), BasicErrorResponseType::InvalidGrant) {
+            let desc = r.error_description().map(String::as_str).unwrap_or("");
+            if desc.contains("AADSTS65001")
+                || desc.contains("consent_required")
+                || desc.contains("interaction_required")
+            {
+                return AuthError::ConsentRequired;
+            }
+            // Revoked/expired refresh token → interactive sign-in again.
+            return AuthError::NeedsSignIn;
+        }
+    }
+    AuthError::OAuth(e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn strict_scopes_exclude_mail_readwrite() {
-        assert!(SCOPES.iter().all(|s| !s.contains("Mail.ReadWrite")));
+    fn scopes_include_readwrite_and_offline() {
+        assert!(SCOPES.contains(&"https://graph.microsoft.com/Mail.ReadWrite"));
         assert!(SCOPES.contains(&"offline_access"));
-        assert_eq!(SCOPES.len(), 4);
+        // Nothing broader than a plain delegated Mail.ReadWrite.
+        assert!(SCOPES
+            .iter()
+            .all(|s| !s.contains(".Shared") && !s.contains(".All")));
+    }
+
+    #[test]
+    fn refresh_error_classification() {
+        use oauth2::{http::StatusCode, StandardErrorResponse};
+
+        // Helper: build an invalid_grant server error with a given description.
+        let server_err = |desc: &str| {
+            let body = StandardErrorResponse::new(
+                BasicErrorResponseType::InvalidGrant,
+                Some(desc.to_string()),
+                None,
+            );
+            RequestTokenError::<oauth2::HttpClientError<reqwest::Error>, _>::ServerResponse(body)
+        };
+        let _ = StatusCode::OK; // keep the import honest across oauth2 versions
+
+        assert!(matches!(
+            map_refresh_error(server_err(
+                "AADSTS65001: The user or administrator has not consented"
+            )),
+            AuthError::ConsentRequired
+        ));
+        assert!(matches!(
+            map_refresh_error(server_err("AADSTS700082: refresh token has expired")),
+            AuthError::NeedsSignIn
+        ));
     }
 
     #[test]

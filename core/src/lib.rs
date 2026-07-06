@@ -6,6 +6,7 @@ pub mod auth;
 pub mod compose;
 pub mod config;
 pub mod graph;
+pub mod ops;
 pub mod sanitize;
 pub mod store;
 pub mod sync;

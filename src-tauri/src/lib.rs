@@ -6,7 +6,8 @@ use spite_core::auth::token_store::KeyringTokenStore;
 use spite_core::auth::{Account, Authenticator, DeviceCodePrompt};
 use spite_core::compose::{self, ComposeMode, Draft, EmailAddress};
 use spite_core::config::AppConfig;
-use spite_core::graph::{GraphMailSource, ServerHit};
+use spite_core::graph::{DraftHandle, GraphMailSource, ServerHit};
+use spite_core::ops::{execute_op, MailOp};
 use spite_core::sanitize::sanitize_html;
 use spite_core::store::{
     build_kql, Folder, MailStore, MailStoreError, Message, MessageSummary, SavedSearch,
@@ -56,6 +57,25 @@ struct SendQueuedEvent {
 struct SendResultEvent {
     id: u64,
     error: Option<String>,
+}
+
+/// Undoable mail-management ops (archive/move/soft-delete/hard-delete) wait
+/// out a countdown here, exactly like `SendQueue`. Each entry keeps the
+/// pre-op message snapshot so Undo (or a failed Graph call on lapse) can
+/// restore the optimistic local change. Claim-by-remove is cancellation.
+#[derive(Default)]
+struct OpQueue {
+    pending: Mutex<HashMap<u64, (MailOp, Box<Message>)>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpQueuedEvent {
+    id: u64,
+    /// "archive" | "delete" | "move" — drives the toast label.
+    label: String,
+    subject: String,
+    deadline_ms: u64,
 }
 
 fn now_ms() -> u64 {
@@ -295,6 +315,10 @@ struct ComposeContext {
     restored: Option<Draft>,
     /// Why the draft came back, if it came back from a failure.
     restore_error: Option<String>,
+    /// Server draft id (Phase 7): present when a `createReply*` draft was
+    /// created — the composer then autosaves + sends via it. `None` means the
+    /// offline MIME path (Phase 5) is used.
+    draft_id: Option<String>,
 }
 
 impl ComposeContext {
@@ -311,6 +335,7 @@ impl ComposeContext {
             degraded: false,
             restored: None,
             restore_error: None,
+            draft_id: None,
         }
     }
 }
@@ -448,6 +473,20 @@ async fn get_compose_context(
         _ => (None, vec![]), // forwards don't thread; degraded replies can't
     };
 
+    // Phase 7: when online, create a server draft (createReply/ReplyAll/
+    // Forward) — Exchange handles the quote + threading, and the draft is
+    // editable across sessions. If it fails (offline), fall back to the MIME
+    // path below (draft_id stays None).
+    let draft_id = if degraded {
+        None
+    } else {
+        source
+            .create_reply_draft(&message_id, &mode_str)
+            .await
+            .ok()
+            .map(|d| d.id)
+    };
+
     Ok(ComposeContext {
         to,
         cc,
@@ -456,6 +495,7 @@ async fn get_compose_context(
         in_reply_to,
         references,
         degraded,
+        draft_id,
         ..ComposeContext::empty(mode_str, signature)
     })
 }
@@ -664,6 +704,244 @@ fn get_keymap(config: State<'_, AppConfig>) -> std::collections::HashMap<String,
     config.keymap.clone()
 }
 
+// --- Phase 7 mail management ---
+
+/// Immediate optimistic op (read/flag/categories/inference): apply locally,
+/// call Graph, roll back on failure. The UI updates its own state instantly
+/// and reverts if this returns an error.
+#[tauri::command]
+async fn apply_op(
+    op: MailOp,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<String, String> {
+    let writer = GraphMailSource::new(Arc::clone(&auth));
+    execute_op(&store, &writer, op)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Undoable op (archive/move/soft-delete/hard-delete): apply locally now,
+/// show the undo toast, fire Graph on lapse. Undo reverts. Mirrors the
+/// undo-send flow.
+#[tauri::command]
+async fn queue_op(
+    app: AppHandle,
+    op: MailOp,
+    label: String,
+    queue: State<'_, Arc<OpQueue>>,
+    store: State<'_, Arc<dyn MailStore>>,
+    config: State<'_, AppConfig>,
+) -> Result<(), String> {
+    let msg_id = op.message_id().to_string();
+    let snapshot = {
+        let id = msg_id.clone();
+        store_call(&store, move |s| s.get_message(&id)).await?
+    }
+    .ok_or_else(|| "message not found".to_string())?;
+
+    // Optimistic local apply so the row leaves the list immediately.
+    apply_op_locally(&store, &op, &snapshot).await?;
+
+    let id = queue
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let delay = config.undo_send_seconds.min(120);
+    let _ = app.emit(
+        "op:queued",
+        &OpQueuedEvent {
+            id,
+            label,
+            subject: snapshot.summary.subject.clone(),
+            deadline_ms: now_ms() + u64::from(delay) * 1000,
+        },
+    );
+    queue
+        .pending
+        .lock()
+        .unwrap()
+        .insert(id, (op, Box::new(snapshot)));
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(delay))).await;
+        }
+        perform_op(&handle, id).await;
+    });
+    Ok(())
+}
+
+/// Cancel a queued op and restore the optimistic local change.
+#[tauri::command]
+async fn undo_op(
+    id: u64,
+    queue: State<'_, Arc<OpQueue>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<(), String> {
+    let entry = queue.pending.lock().unwrap().remove(&id);
+    let Some((_, snapshot)) = entry else {
+        return Err("too late — already applied".to_string());
+    };
+    store_call(&store, move |s| s.upsert_messages(&[*snapshot])).await
+}
+
+/// Apply an op's local mutation (used both for the optimistic queue apply and
+/// nowhere else — the immediate path goes through `execute_op`).
+async fn apply_op_locally(
+    store: &Arc<dyn MailStore>,
+    op: &MailOp,
+    _snapshot: &Message,
+) -> Result<(), String> {
+    match op {
+        MailOp::Move { id, dest_folder_id } => {
+            let (id, dest) = (id.clone(), dest_folder_id.clone());
+            store_call(store, move |s| s.move_message(&id, &dest, None)).await
+        }
+        MailOp::HardDelete { id } => {
+            let id = id.clone();
+            store_call(store, move |s| s.delete_message(&id)).await
+        }
+        // Only move/delete are ever queued; others go through apply_op.
+        _ => Ok(()),
+    }
+}
+
+/// Fire a queued op's Graph call on lapse; roll back the local change on
+/// failure. Claim-by-remove: a missing entry was undone.
+async fn perform_op(app: &AppHandle, id: u64) {
+    let queue = app.state::<Arc<OpQueue>>();
+    let Some((op, snapshot)) = queue.pending.lock().unwrap().remove(&id) else {
+        return;
+    };
+    let auth = Arc::clone(&app.state::<Arc<Authenticator>>());
+    let store = Arc::clone(&app.state::<Arc<dyn MailStore>>());
+    let writer = GraphMailSource::new(auth);
+
+    // The local change is already applied; call Graph and reconcile.
+    let result = call_writer_for_queued(&writer, &store, &op).await;
+    match result {
+        Ok(()) => {
+            let _ = app.emit("op:done", &SendResultEvent { id, error: None });
+        }
+        Err(e) => {
+            // Restore the optimistic change.
+            let _ = store_call(&store, move |s| s.upsert_messages(&[*snapshot])).await;
+            let _ = app.emit(
+                "op:done",
+                &SendResultEvent {
+                    id,
+                    error: Some(e.clone()),
+                },
+            );
+            tracing::warn!(error = %e, "queued op failed; rolled back");
+        }
+    }
+}
+
+async fn call_writer_for_queued(
+    writer: &GraphMailSource,
+    store: &Arc<dyn MailStore>,
+    op: &MailOp,
+) -> Result<(), String> {
+    use spite_core::ops::MailWriter;
+    match op {
+        MailOp::Move { id, dest_folder_id } => {
+            let new_id = writer
+                .move_message(id, dest_folder_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Reconcile the local row to the destination copy's new id.
+            let (id, dest) = (id.clone(), dest_folder_id.clone());
+            store_call(store, move |s| s.move_message(&id, &dest, Some(&new_id)))
+                .await
+                .map(|_| ())
+        }
+        MailOp::HardDelete { id } => writer.delete_message(id).await.map_err(|e| e.to_string()),
+        _ => Ok(()),
+    }
+}
+
+// --- Drafts (createReply/createForward/blank) ---
+
+#[tauri::command]
+async fn create_reply_draft(
+    mode: String,
+    message_id: String,
+    auth: State<'_, Arc<Authenticator>>,
+) -> Result<DraftHandle, String> {
+    GraphMailSource::new(Arc::clone(&auth))
+        .create_reply_draft(&message_id, &mode)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn create_blank_draft(auth: State<'_, Arc<Authenticator>>) -> Result<DraftHandle, String> {
+    GraphMailSource::new(Arc::clone(&auth))
+        .create_draft()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn autosave_draft(
+    draft_id: String,
+    subject: String,
+    body: String,
+    to: Vec<EmailAddress>,
+    cc: Vec<EmailAddress>,
+    bcc: Vec<EmailAddress>,
+    auth: State<'_, Arc<Authenticator>>,
+) -> Result<(), String> {
+    GraphMailSource::new(Arc::clone(&auth))
+        .update_draft(&draft_id, &subject, &body, &to, &cc, &bcc)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn send_draft(draft_id: String, auth: State<'_, Arc<Authenticator>>) -> Result<(), String> {
+    GraphMailSource::new(Arc::clone(&auth))
+        .send_draft(&draft_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Attach a base64 file to a draft — inline if small, chunked upload session
+/// if >3 MB, with `attach:progress` events carrying (sent, total).
+#[tauri::command]
+async fn attach_to_draft(
+    app: AppHandle,
+    draft_id: String,
+    name: String,
+    content_type: String,
+    content_base64: String,
+    auth: State<'_, Arc<Authenticator>>,
+) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(content_base64.as_bytes())
+        .map_err(|_| "attachment is not valid base64".to_string())?;
+    let handle = app.clone();
+    let name_for_evt = name.clone();
+    GraphMailSource::new(Arc::clone(&auth))
+        .attach_to_draft(
+            &draft_id,
+            &name,
+            &content_type,
+            &bytes,
+            move |sent, total| {
+                let _ = handle.emit(
+                    "attach:progress",
+                    &serde_json::json!({ "name": name_for_evt, "sent": sent, "total": total }),
+                );
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn autocomplete_recipients(
     query: String,
@@ -745,6 +1023,7 @@ pub fn run() {
             app.manage(config);
             app.manage(ComposeRegistry::default());
             app.manage(Arc::new(SendQueue::default()));
+            app.manage(Arc::new(OpQueue::default()));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -789,7 +1068,15 @@ pub fn run() {
             list_saved_searches,
             save_search,
             delete_saved_search,
-            get_keymap
+            get_keymap,
+            apply_op,
+            queue_op,
+            undo_op,
+            create_reply_draft,
+            create_blank_draft,
+            autosave_draft,
+            send_draft,
+            attach_to_draft
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -798,14 +1085,37 @@ pub fn run() {
             // pressed Send, so fire the pending sends now instead of never.
             // (Bounded by the HTTP client's 30s timeout per message.)
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                let queue = app_handle.state::<Arc<SendQueue>>();
-                let ids: Vec<u64> = queue.pending.lock().unwrap().keys().copied().collect();
-                if !ids.is_empty() {
-                    tracing::info!(count = ids.len(), "flushing queued sends before exit");
+                let send_ids: Vec<u64> = app_handle
+                    .state::<Arc<SendQueue>>()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .copied()
+                    .collect();
+                // Pending management ops committed to the server too — flush
+                // them so an archive/delete the user asked for isn't lost.
+                let op_ids: Vec<u64> = app_handle
+                    .state::<Arc<OpQueue>>()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .copied()
+                    .collect();
+                if !send_ids.is_empty() || !op_ids.is_empty() {
+                    tracing::info!(
+                        sends = send_ids.len(),
+                        ops = op_ids.len(),
+                        "flushing queued work before exit"
+                    );
                     let handle = app_handle.clone();
                     tauri::async_runtime::block_on(async move {
-                        for id in ids {
+                        for id in send_ids {
                             perform_send(&handle, id).await;
+                        }
+                        for id in op_ids {
+                            perform_op(&handle, id).await;
                         }
                     });
                 }

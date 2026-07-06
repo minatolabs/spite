@@ -5,12 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use base64::Engine;
 
 use crate::auth::{AuthError, Authenticator};
 use crate::compose::{parse_references, EmailAddress, ReplyContext};
+use crate::ops::MailWriter;
 use crate::store::{Folder, Message, MessageSummary};
 use crate::sync::{DeltaPage, DeltaRequest, MailSource, PageToken, SourceError};
 
@@ -51,7 +52,8 @@ pub async fn get_me(http: &reqwest::Client, access_token: &str) -> Result<Me, Gr
 /// excluded (lazy-loaded on open, Phase 4). internetMessageId backs
 /// server-search dedupe (Phase 6).
 pub const MESSAGE_SELECT: &str = "id,subject,from,receivedDateTime,bodyPreview,isRead,\
-     hasAttachments,conversationId,parentFolderId,internetMessageId";
+     hasAttachments,conversationId,parentFolderId,internetMessageId,flag,\
+     inferenceClassification,categories,isDraft";
 const DELTA_PAGE_SIZE: u32 = 100;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -131,6 +133,69 @@ impl GraphMailSource {
         }
         unreachable!("the 401-retry loop always returns within two attempts")
     }
+
+    /// Authenticated write with the same 401/429 mapping as `get_json`. The
+    /// `build` closure produces a fresh request each attempt (bodies aren't
+    /// clonable across the retry). Returns the raw response for the caller to
+    /// interpret (202/201/200/204 all appear across the write endpoints).
+    async fn send_authed<B>(&self, build: B) -> Result<reqwest::Response, SourceError>
+    where
+        B: Fn() -> reqwest::RequestBuilder,
+    {
+        for attempt in 0..2 {
+            let token = self.auth.access_token().await.map_err(|e| match e {
+                AuthError::NeedsSignIn | AuthError::NotConfigured => SourceError::Unauthorized,
+                other => SourceError::Http(other.to_string()),
+            })?;
+            let resp = build()
+                .bearer_auth(token)
+                .send()
+                .await
+                .map_err(|e| SourceError::Http(e.to_string()))?;
+            let status = resp.status().as_u16();
+            match status {
+                401 if attempt == 0 => {
+                    self.auth.invalidate_session().await;
+                    continue;
+                }
+                401 => return Err(SourceError::Unauthorized),
+                // A write rejected for consent (revoked scope) surfaces clearly.
+                403 => {
+                    return Err(SourceError::Http(format!(
+                        "403 access denied — Spite may need mail-management \
+                         permission re-granted: {}",
+                        resp.text().await.unwrap_or_default()
+                    )));
+                }
+                429 => {
+                    let retry_after = resp
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(5);
+                    return Err(SourceError::Throttled {
+                        retry_after: Duration::from_secs(retry_after),
+                    });
+                }
+                s if !(200..300).contains(&s) => {
+                    return Err(SourceError::Http(format!(
+                        "{s}: {}",
+                        resp.text().await.unwrap_or_default()
+                    )));
+                }
+                _ => return Ok(resp),
+            }
+        }
+        unreachable!("the 401-retry loop always returns within two attempts")
+    }
+
+    async fn patch_message(&self, id: &str, body: serde_json::Value) -> Result<(), SourceError> {
+        let url = format!("{GRAPH_BASE}/me/messages/{id}");
+        self.send_authed(|| self.http.patch(&url).json(&body))
+            .await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +235,16 @@ struct GraphMessage {
     conversation_id: Option<String>,
     parent_folder_id: Option<String>,
     internet_message_id: Option<String>,
+    flag: Option<GraphFlag>,
+    inference_classification: Option<String>,
+    categories: Option<Vec<String>>,
+    is_draft: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphFlag {
+    flag_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,11 +360,20 @@ fn to_domain(g: GraphMessage) -> Message {
             preview: g.body_preview.unwrap_or_default(),
             is_read: g.is_read.unwrap_or(false),
             has_attachments: g.has_attachments.unwrap_or(false),
+            flag_status: g
+                .flag
+                .and_then(|f| f.flag_status)
+                .unwrap_or_else(|| "notFlagged".to_string()),
+            inference_classification: g
+                .inference_classification
+                .unwrap_or_else(|| "focused".to_string()),
+            is_draft: g.is_draft.unwrap_or(false),
         },
         conversation_id: g.conversation_id,
         body_html: None, // never fetched during sync; lazy-loaded on open
         body_content_type: None,
         internet_message_id: g.internet_message_id,
+        categories: g.categories.unwrap_or_default(),
     }
 }
 
@@ -316,7 +400,196 @@ pub const WELL_KNOWN_FOLDERS: [&str; 6] = [
     "deleteditems",
 ];
 
+/// A server-created draft (createReply / createDraft response).
+#[derive(Debug, Clone, Serialize)]
+pub struct DraftHandle {
+    pub id: String,
+    /// Sanitized HTML body the server pre-filled (quote for replies/forwards).
+    pub body_html: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphDraft {
+    id: String,
+    subject: Option<String>,
+    body: Option<GraphBody>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadSession {
+    upload_url: String,
+}
+
+/// Chunk size for attachment upload sessions: a multiple of 320 KiB, as
+/// Graph requires. 3.2 MiB keeps each PUT well under limits while minimizing
+/// round-trips.
+const UPLOAD_CHUNK: usize = 10 * 320 * 1024;
+
 impl GraphMailSource {
+    /// Server-built reply/reply-all/forward draft (needs `Mail.ReadWrite`).
+    /// The body it returns embeds the original message and is sanitized
+    /// before it reaches the composer.
+    pub async fn create_reply_draft(
+        &self,
+        message_id: &str,
+        mode: &str,
+    ) -> Result<DraftHandle, SourceError> {
+        let action = match mode {
+            "reply" => "createReply",
+            "replyAll" => "createReplyAll",
+            "forward" => "createForward",
+            other => {
+                return Err(SourceError::Protocol(format!("unknown reply mode {other}")));
+            }
+        };
+        let url = format!("{GRAPH_BASE}/me/messages/{message_id}/{action}");
+        let resp = self.send_authed(|| self.http.post(&url)).await?;
+        let draft: GraphDraft = resp
+            .json()
+            .await
+            .map_err(|e| SourceError::Protocol(e.to_string()))?;
+        Ok(self.to_draft_handle(draft))
+    }
+
+    /// A blank draft for a fresh compose (needs `Mail.ReadWrite`).
+    pub async fn create_draft(&self) -> Result<DraftHandle, SourceError> {
+        let url = format!("{GRAPH_BASE}/me/messages");
+        let body = serde_json::json!({ "body": { "contentType": "HTML", "content": "" } });
+        let resp = self
+            .send_authed(|| self.http.post(&url).json(&body))
+            .await?;
+        let draft: GraphDraft = resp
+            .json()
+            .await
+            .map_err(|e| SourceError::Protocol(e.to_string()))?;
+        Ok(self.to_draft_handle(draft))
+    }
+
+    fn to_draft_handle(&self, d: GraphDraft) -> DraftHandle {
+        let raw = d.body.and_then(|b| b.content).unwrap_or_default();
+        DraftHandle {
+            id: d.id,
+            body_html: crate::sanitize::sanitize_html(&raw),
+            subject: d.subject.unwrap_or_default(),
+        }
+    }
+
+    /// Autosave: PATCH recipients/subject/body onto an existing draft.
+    /// Body HTML is sanitized here too — the sanitizer invariant holds for
+    /// drafts. `recipients` are (field, address, name) with field in
+    /// {toRecipients, ccRecipients, bccRecipients}.
+    pub async fn update_draft(
+        &self,
+        draft_id: &str,
+        subject: &str,
+        body_html: &str,
+        to: &[EmailAddress],
+        cc: &[EmailAddress],
+        bcc: &[EmailAddress],
+    ) -> Result<(), SourceError> {
+        let recips = |list: &[EmailAddress]| -> Vec<serde_json::Value> {
+            list.iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "emailAddress": { "address": a.address, "name": a.name }
+                    })
+                })
+                .collect()
+        };
+        let body = serde_json::json!({
+            "subject": subject,
+            "body": { "contentType": "HTML", "content": crate::sanitize::sanitize_html(body_html) },
+            "toRecipients": recips(to),
+            "ccRecipients": recips(cc),
+            "bccRecipients": recips(bcc),
+        });
+        self.patch_message(draft_id, body).await
+    }
+
+    /// Send an existing draft (`POST /me/messages/{id}/send`, 202).
+    pub async fn send_draft(&self, draft_id: &str) -> Result<(), SourceError> {
+        let url = format!("{GRAPH_BASE}/me/messages/{draft_id}/send");
+        self.send_authed(|| self.http.post(&url)).await?;
+        Ok(())
+    }
+
+    /// Attach a file to a draft. ≤3 MB goes inline as a fileAttachment;
+    /// larger files use a resumable upload session with chunked PUTs and
+    /// per-chunk progress via `on_progress(bytes_sent, total)`.
+    pub async fn attach_to_draft(
+        &self,
+        draft_id: &str,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+        on_progress: impl Fn(u64, u64),
+    ) -> Result<(), SourceError> {
+        const INLINE_LIMIT: usize = 3 * 1024 * 1024;
+        let total = bytes.len() as u64;
+        if bytes.len() <= INLINE_LIMIT {
+            let url = format!("{GRAPH_BASE}/me/messages/{draft_id}/attachments");
+            let body = serde_json::json!({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": name,
+                "contentType": content_type,
+                "contentBytes": base64::engine::general_purpose::STANDARD.encode(bytes),
+            });
+            self.send_authed(|| self.http.post(&url).json(&body))
+                .await?;
+            on_progress(total, total);
+            return Ok(());
+        }
+
+        // Large file: create the upload session, then PUT sequential ranges.
+        let session_url =
+            format!("{GRAPH_BASE}/me/messages/{draft_id}/attachments/createUploadSession");
+        let session_body = serde_json::json!({
+            "AttachmentItem": {
+                "attachmentType": "file",
+                "name": name,
+                "size": bytes.len(),
+            }
+        });
+        let resp = self
+            .send_authed(|| self.http.post(&session_url).json(&session_body))
+            .await?;
+        let session: UploadSession = resp
+            .json()
+            .await
+            .map_err(|e| SourceError::Protocol(e.to_string()))?;
+
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let end = (offset + UPLOAD_CHUNK).min(bytes.len());
+            let chunk = bytes[offset..end].to_vec();
+            let range = format!("bytes {offset}-{}/{}", end - 1, bytes.len());
+            // The uploadUrl is pre-authenticated — no bearer token, and it
+            // isn't a Graph endpoint, so bypass send_authed.
+            let put = self
+                .http
+                .put(&session.upload_url)
+                .header("Content-Length", chunk.len())
+                .header("Content-Range", range)
+                .body(chunk)
+                .send()
+                .await
+                .map_err(|e| SourceError::Http(e.to_string()))?;
+            let s = put.status().as_u16();
+            if !(200..300).contains(&s) {
+                return Err(SourceError::Http(format!(
+                    "upload chunk {s}: {}",
+                    put.text().await.unwrap_or_default()
+                )));
+            }
+            offset = end;
+            on_progress(offset as u64, total);
+        }
+        Ok(())
+    }
+
     /// All mail folders: the well-known set resolved via their aliases
     /// (v1.0's mailFolder has no wellKnownName property, so addressing each
     /// alias is how we learn which id is which), plus the user's top-level
@@ -534,6 +807,50 @@ impl GraphMailSource {
             content: body.content.unwrap_or_default(),
             content_type: content_type.to_string(),
         })
+    }
+}
+
+impl MailWriter for GraphMailSource {
+    async fn set_read(&self, id: &str, is_read: bool) -> Result<(), SourceError> {
+        self.patch_message(id, serde_json::json!({ "isRead": is_read }))
+            .await
+    }
+
+    async fn set_flag(&self, id: &str, flagged: bool) -> Result<(), SourceError> {
+        let status = if flagged { "flagged" } else { "notFlagged" };
+        self.patch_message(id, serde_json::json!({ "flag": { "flagStatus": status } }))
+            .await
+    }
+
+    async fn set_categories(&self, id: &str, categories: &[String]) -> Result<(), SourceError> {
+        self.patch_message(id, serde_json::json!({ "categories": categories }))
+            .await
+    }
+
+    async fn set_inference(&self, id: &str, focused: bool) -> Result<(), SourceError> {
+        let c = if focused { "focused" } else { "other" };
+        self.patch_message(id, serde_json::json!({ "inferenceClassification": c }))
+            .await
+    }
+
+    async fn move_message(&self, id: &str, dest_folder_id: &str) -> Result<String, SourceError> {
+        // Graph move returns the destination copy, which has a NEW id.
+        let url = format!("{GRAPH_BASE}/me/messages/{id}/move");
+        let body = serde_json::json!({ "destinationId": dest_folder_id });
+        let resp = self
+            .send_authed(|| self.http.post(&url).json(&body))
+            .await?;
+        let moved: GraphDraft = resp
+            .json()
+            .await
+            .map_err(|e| SourceError::Protocol(e.to_string()))?;
+        Ok(moved.id)
+    }
+
+    async fn delete_message(&self, id: &str) -> Result<(), SourceError> {
+        let url = format!("{GRAPH_BASE}/me/messages/{id}");
+        self.send_authed(|| self.http.delete(&url)).await?;
+        Ok(())
     }
 }
 

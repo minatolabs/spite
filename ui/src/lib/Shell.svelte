@@ -11,7 +11,17 @@
   import SendToasts from './SendToasts.svelte'
   import SignatureSettings from './SignatureSettings.svelte'
   import StatusBar from './StatusBar.svelte'
-  import { clearSearch, flash, initMail, mail, searchActive, selectedFolder, syncNow } from './mail.svelte'
+  import {
+    archive,
+    clearSearch,
+    initMail,
+    mail,
+    searchActive,
+    selectedFolder,
+    softDelete,
+    syncNow,
+    toggleFlag,
+  } from './mail.svelte'
 
   type Account = { upn: string; display_name: string }
   let { account, onsignout }: { account: Account; onsignout: () => void } = $props()
@@ -95,14 +105,21 @@
       e.preventDefault()
       composeNew()
     } else if (key === keymap.archive) {
-      e.preventDefault()
-      flash('Archive needs mail management — a later phase')
+      if (mail.selectedId) {
+        e.preventDefault()
+        void archive(mail.selectedId)
+      }
     } else if (key === keymap.delete) {
-      e.preventDefault()
-      flash('Delete needs mail management — a later phase')
+      if (mail.selectedId) {
+        e.preventDefault()
+        void softDelete(mail.selectedId)
+      }
     } else if (key === keymap.flag) {
-      e.preventDefault()
-      flash('Flag needs mail management — a later phase')
+      const m = mail.messages.find((x) => x.id === mail.selectedId)
+      if (m) {
+        e.preventDefault()
+        toggleFlag(m)
+      }
     }
   }
 

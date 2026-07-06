@@ -295,11 +295,15 @@ mod tests {
                 preview: String::new(),
                 is_read,
                 has_attachments: false,
+                flag_status: "notFlagged".to_string(),
+                inference_classification: "focused".to_string(),
+                is_draft: false,
             },
             conversation_id: None,
             body_html: None,
             body_content_type: None,
             internet_message_id: None,
+            categories: Vec::new(),
         }
     }
 

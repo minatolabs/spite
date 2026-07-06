@@ -20,6 +20,7 @@
   let prompt: DeviceCodePrompt | null = $state(null)
   let busy = $state(false)
   let error = $state('')
+  let consentRequired = $state(false)
 
   onMount(() => {
     let unlisten: UnlistenFn | undefined
@@ -29,7 +30,14 @@
 
     invoke<Account>('silent_sign_in')
       .then((a) => (account = a))
-      .catch(() => {}) // not signed in yet — show the sign-in button
+      .catch((e) => {
+        // A scope escalation (Phase 7's Mail.ReadWrite) makes the cached
+        // token insufficient; the shell reports this distinctly so we can
+        // ask for re-consent rather than showing a generic sign-in.
+        if (String(e).toLowerCase().includes('permission to manage your mail')) {
+          consentRequired = true
+        }
+      })
       .finally(() => (checking = false))
 
     return () => unlisten?.()
@@ -69,8 +77,18 @@
     {#if checking}
       <p class="muted">Checking sign-in…</p>
     {:else}
+      {#if consentRequired}
+        <p class="consent">
+          Spite needs permission to manage your mail (read, flag, move, delete,
+          and drafts). Sign in again to grant it — your account stays connected.
+        </p>
+      {/if}
       <button class="sp-btn sp-btn--primary" onclick={signIn} disabled={busy}>
-        {busy ? 'Waiting for sign-in…' : 'Sign in with Microsoft'}
+        {busy
+          ? 'Waiting for sign-in…'
+          : consentRequired
+            ? 'Grant permission'
+            : 'Sign in with Microsoft'}
       </button>
       {#if prompt}
         <div class="prompt">
@@ -108,6 +126,13 @@
     font-weight: 600;
     letter-spacing: var(--sp-track-wordmark);
     color: var(--sp-text-display);
+  }
+
+  .consent {
+    max-width: 26rem;
+    color: var(--sp-text-secondary);
+    font-size: var(--sp-fs-small);
+    line-height: var(--sp-lh-ui);
   }
 
   .muted {

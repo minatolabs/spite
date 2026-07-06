@@ -39,12 +39,16 @@
     degraded: boolean
     restored: Draft | null
     restore_error: string | null
+    draft_id: string | null
   }
   type Attachment = { name: string; content_type: string; content_base64: string; size: number }
 
   let { label }: { label: string } = $props()
 
-  const MAX_TOTAL = 2 * 1024 * 1024
+  // MIME send caps inline attachments at 2 MB; a server draft can carry up
+  // to Graph's 150 MB via a chunked upload session.
+  const MIME_MAX = 2 * 1024 * 1024
+  const DRAFT_MAX = 150 * 1024 * 1024
 
   let mode = $state('new')
   let to: EmailAddress[] = $state([])
@@ -64,6 +68,10 @@
   let error = $state('')
   let attachError = $state('')
   let dirty = $state(false)
+  /// Server draft id (Phase 7). When set, we autosave + send via Graph draft
+  /// endpoints; when null, the offline MIME send path is used.
+  let draftId: string | null = $state(null)
+  let savedAt = $state('')
   let initialHtml = $state('')
   let initialApplied = false
 
@@ -118,6 +126,7 @@
           inReplyTo = ctx.in_reply_to
           references = ctx.references
           degraded = ctx.degraded
+          draftId = ctx.draft_id
           const sig = ctx.signature
             ? `<p><br></p><p>--&nbsp;<br>${escapeHtml(ctx.signature).replace(/\n/g, '<br>')}</p>`
             : '<p><br></p>'
@@ -142,8 +151,37 @@
     }
   })
 
+  let autosaveTimer: ReturnType<typeof setTimeout> | undefined
+
   function markDirty() {
     dirty = true
+    // Debounced autosave for server drafts (~3s), so edits survive across
+    // sessions in the Drafts folder.
+    if (draftId) {
+      clearTimeout(autosaveTimer)
+      autosaveTimer = setTimeout(() => void autosave(), 3000)
+    }
+  }
+
+  async function autosave() {
+    if (!draftId) return
+    try {
+      const body = plainText ? textBody : (bodyEl?.innerHTML ?? '')
+      await invoke('autosave_draft', {
+        draftId,
+        subject,
+        body,
+        to,
+        cc,
+        bcc,
+      })
+      savedAt = new Date().toLocaleTimeString(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
+      })
+    } catch {
+      // Non-fatal — a later save (or send) retries.
+    }
   }
 
   function exec(command: string, value?: string) {
@@ -242,10 +280,13 @@
     attachError = ''
     const files = (e.target as HTMLInputElement).files
     if (!files) return
+    const cap = draftId ? DRAFT_MAX : MIME_MAX
     for (const file of files) {
       const currentTotal = attachments.reduce((n, a) => n + a.size, 0)
-      if (currentTotal + file.size > MAX_TOTAL) {
-        attachError = `"${file.name}" is too large — inline attachments are capped at 2 MB total; larger uploads arrive with a later phase.`
+      if (currentTotal + file.size > cap) {
+        attachError = draftId
+          ? `"${file.name}" is too large — the limit is 150 MB total.`
+          : `"${file.name}" is too large — offline sends cap attachments at 2 MB total.`
         continue
       }
       const b64 = await new Promise<string>((resolve, reject) => {
@@ -287,27 +328,45 @@
     sending = true
     try {
       const body = plainText ? textBody : (bodyEl?.innerHTML ?? '')
-      await invoke('queue_send', {
-        draft: {
-          to,
-          cc,
-          bcc,
-          subject,
-          body,
-          content_type: plainText ? 'text' : 'html',
-          in_reply_to: inReplyTo,
-          references,
-          attachments: attachments.map(({ name, content_type, content_base64 }) => ({
-            name,
-            content_type,
-            content_base64,
-          })),
-        },
-      })
+      if (draftId) {
+        // Server-draft path: save latest content, upload attachments to the
+        // draft (large ones via a chunked upload session), then send. Fires
+        // immediately (no undo window) — autosave already keeps it safe.
+        clearTimeout(autosaveTimer)
+        await autosave()
+        for (const a of attachments) {
+          await invoke('attach_to_draft', {
+            draftId,
+            name: a.name,
+            contentType: a.content_type,
+            contentBase64: a.content_base64,
+          })
+        }
+        await invoke('send_draft', { draftId })
+      } else {
+        // Offline / new-compose MIME path with the undo-send countdown.
+        await invoke('queue_send', {
+          draft: {
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            content_type: plainText ? 'text' : 'html',
+            in_reply_to: inReplyTo,
+            references,
+            attachments: attachments.map(({ name, content_type, content_base64 }) => ({
+              name,
+              content_type,
+              content_base64,
+            })),
+          },
+        })
+      }
       dirty = false
       await getCurrentWindow().close()
     } catch (e) {
-      // Rejected before queueing (validation): draft stays right here.
+      // Rejected (validation / send failure): draft stays right here.
       error = String(e)
     } finally {
       sending = false
@@ -413,9 +472,12 @@
   <footer class="actions">
     <button class="sp-btn sp-btn--primary" onclick={() => void send()} disabled={sending || loading}>
       <Send size={13} />
-      {sending ? 'Queueing…' : 'Send'}
+      {sending ? 'Sending…' : 'Send'}
     </button>
-    <span class="hint">Ctrl+Enter to send · undo from the main window after sending</span>
+    <span class="hint">
+      Ctrl+Enter to send{draftId ? '' : ' · undo from the main window after sending'}
+      {#if savedAt}· draft saved {savedAt}{/if}
+    </span>
   </footer>
 </main>
 

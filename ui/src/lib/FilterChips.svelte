@@ -2,7 +2,7 @@
   import { Flag, Mail as MailIcon, Paperclip } from 'lucide-svelte'
   import { mail, runSearch } from './mail.svelte'
 
-  function toggle(key: 'unread_only' | 'has_attachments') {
+  function toggle(key: 'unread_only' | 'has_attachments' | 'flagged_only') {
     mail.chips[key] = !mail.chips[key]
     void runSearch()
   }
@@ -42,11 +42,7 @@
     bind:value={mail.chips.from}
     oninput={onFromInput}
   />
-  <button
-    class="chip disabled"
-    title="Flag data isn't synced yet — flags arrive with the mail-management phase"
-    disabled
-  >
+  <button class="chip" class:on={mail.chips.flagged_only} onclick={() => toggle('flagged_only')}>
     <Flag size={11} /> Flagged
   </button>
 </div>
@@ -83,11 +79,6 @@
     color: var(--sp-text-accent);
     background: rgba(138, 43, 49, 0.18);
     border-color: rgba(138, 43, 49, 0.5);
-  }
-
-  .chip.disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
   }
 
   .chip.from {

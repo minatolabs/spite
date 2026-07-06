@@ -1,7 +1,55 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
-  import { Forward, ImageOff, Mail, Reply, ReplyAll } from 'lucide-svelte'
-  import { mail, type Message, type MessageBody } from './mail.svelte'
+  import {
+    Archive,
+    Flag,
+    Forward,
+    ImageOff,
+    Inbox,
+    Mail,
+    MailOpen,
+    Reply,
+    ReplyAll,
+    Tag,
+    Trash2,
+    X,
+  } from 'lucide-svelte'
+  import {
+    archive,
+    mail,
+    setCategories,
+    setFocused,
+    softDelete,
+    toggleFlag,
+    toggleRead,
+    type Message,
+    type MessageBody,
+  } from './mail.svelte'
+
+  let addingCategory = $state(false)
+  let newCategory = $state('')
+
+  async function addCategory() {
+    const name = newCategory.trim()
+    if (!name || !message) return
+    const next = [...message.categories, name]
+    message = { ...message, categories: next }
+    addingCategory = false
+    newCategory = ''
+    await setCategories(message.summary.id, next)
+  }
+
+  async function removeCategory(cat: string) {
+    if (!message) return
+    const next = message.categories.filter((c) => c !== cat)
+    message = { ...message, categories: next }
+    await setCategories(message.summary.id, next)
+  }
+
+  function afterListChange() {
+    // Archive/delete remove the row and clear selection.
+    message = null
+  }
 
   let message: Message | null = $state(null)
   let body: MessageBody | null = $state(null)
@@ -34,6 +82,7 @@
             conversation_id: null,
             body_html: null,
             body_content_type: null,
+            categories: [],
           }
         }
         message = m
@@ -137,6 +186,77 @@
           <button class="sp-btn" onclick={() => openCompose('forward')}>
             <Forward size={13} /> Forward
           </button>
+          <span class="gap"></span>
+          <button
+            class="sp-btn"
+            onclick={() => message && toggleRead(message.summary)}
+            title={message.summary.is_read ? 'Mark unread' : 'Mark read'}
+          >
+            {#if message.summary.is_read}<Mail size={13} />{:else}<MailOpen size={13} />{/if}
+          </button>
+          <button
+            class="sp-btn"
+            class:flagged={message.summary.flag_status === 'flagged'}
+            onclick={() => message && toggleFlag(message.summary)}
+            title="Flag"
+          >
+            <Flag size={13} />
+          </button>
+          <button
+            class="sp-btn"
+            onclick={() => {
+              if (message) {
+                void archive(message.summary.id)
+                afterListChange()
+              }
+            }}
+            title="Archive"
+          >
+            <Archive size={13} />
+          </button>
+          <button
+            class="sp-btn sp-btn--danger"
+            onclick={() => {
+              if (message) {
+                void softDelete(message.summary.id)
+                afterListChange()
+              }
+            }}
+            title="Delete (to Deleted Items)"
+          >
+            <Trash2 size={13} />
+          </button>
+          {#if message.summary.inference_classification === 'other'}
+            <button class="sp-btn" onclick={() => message && setFocused(message.summary, true)}>
+              <Inbox size={13} /> Move to Focused
+            </button>
+          {:else}
+            <button class="sp-btn" onclick={() => message && setFocused(message.summary, false)}>
+              Move to Other
+            </button>
+          {/if}
+        </p>
+        <p class="categories">
+          <Tag size={12} />
+          {#each message.categories as cat (cat)}
+            <span class="cat">
+              {cat}
+              <button class="cat-x" onclick={() => removeCategory(cat)}><X size={10} /></button>
+            </span>
+          {/each}
+          {#if addingCategory}
+            <input
+              class="cat-input"
+              bind:value={newCategory}
+              onkeydown={(e) => {
+                if (e.key === 'Enter') void addCategory()
+                if (e.key === 'Escape') addingCategory = false
+              }}
+              placeholder="category…"
+            />
+          {:else}
+            <button class="cat-add" onclick={() => (addingCategory = true)}>+ category</button>
+          {/if}
         </p>
       </header>
     {/if}
@@ -233,7 +353,67 @@
   .msg-actions {
     margin: var(--sp-3) 0 0;
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     gap: var(--sp-2);
+  }
+
+  .gap {
+    width: var(--sp-3);
+  }
+
+  .sp-btn.flagged {
+    color: var(--sp-flag);
+  }
+
+  .categories {
+    margin: var(--sp-2) 0 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--sp-2);
+    color: var(--sp-text-muted);
+  }
+
+  .cat {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 1px var(--sp-2);
+    font-size: var(--sp-fs-caption);
+    color: var(--sp-text-secondary);
+    background: var(--ink-700);
+    border: 1px solid var(--sp-border-control);
+    border-radius: var(--sp-r-pill);
+  }
+
+  .cat-x,
+  .cat-add {
+    border: none;
+    background: none;
+    color: var(--sp-text-tertiary);
+    cursor: pointer;
+    font: inherit;
+    font-size: var(--sp-fs-caption);
+    padding: 0 2px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .cat-add:hover {
+    color: var(--sp-text-primary);
+  }
+
+  .cat-input {
+    width: 100px;
+    border: 1px solid var(--sp-border-hard);
+    background: var(--sp-surface-well);
+    color: var(--sp-text-primary);
+    border-radius: var(--sp-r-control);
+    font: inherit;
+    font-size: var(--sp-fs-caption);
+    padding: 2px var(--sp-2);
+    outline: none;
   }
 
   .images-bar {

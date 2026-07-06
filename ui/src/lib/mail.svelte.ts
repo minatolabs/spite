@@ -16,12 +16,16 @@ export type MessageSummary = {
   preview: string
   is_read: boolean
   has_attachments: boolean
+  flag_status: string
+  inference_classification: string
+  is_draft: boolean
 }
 export type Message = {
   summary: MessageSummary
   conversation_id: string | null
   body_html: string | null
   body_content_type: string | null
+  categories: string[]
 }
 export type SyncState = {
   folder_id: string
@@ -34,6 +38,7 @@ export type SearchFilters = {
   folder_id: string | null
   unread_only: boolean
   has_attachments: boolean
+  flagged_only: boolean
   from: string | null
   date_from: number | null
   date_to: number | null
@@ -67,9 +72,12 @@ export const mail = $state({
   chips: {
     unread_only: false,
     has_attachments: false,
+    flagged_only: false,
     from: '' as string,
     days: 0 as number, // 0 = any time
   },
+  /// Focused-inbox tab in the Inbox: 'focused' | 'other' | 'all'.
+  focusTab: 'all' as 'focused' | 'other' | 'all',
   hits: [] as SearchHit[],
   serverHits: [] as ServerHit[],
   serverSearching: false,
@@ -91,7 +99,9 @@ export function flash(text: string) {
 
 export function chipsActive(): boolean {
   const c = mail.chips
-  return c.unread_only || c.has_attachments || c.from.trim() !== '' || c.days > 0
+  return (
+    c.unread_only || c.has_attachments || c.flagged_only || c.from.trim() !== '' || c.days > 0
+  )
 }
 
 export function searchActive(): boolean {
@@ -104,6 +114,7 @@ function currentFilters(): SearchFilters {
     folder_id: mail.scopeAll ? null : mail.folderId,
     unread_only: c.unread_only,
     has_attachments: c.has_attachments,
+    flagged_only: c.flagged_only,
     from: c.from.trim() || null,
     date_from: c.days > 0 ? Math.floor(Date.now() / 1000) - c.days * 86400 : null,
     date_to: null,
@@ -150,7 +161,7 @@ export async function searchEverywhere() {
 
 export function clearSearch() {
   mail.query = ''
-  mail.chips = { unread_only: false, has_attachments: false, from: '', days: 0 }
+  mail.chips = { unread_only: false, has_attachments: false, flagged_only: false, from: '', days: 0 }
   mail.hits = []
   mail.serverHits = []
   mail.serverSearched = false
@@ -184,6 +195,7 @@ export async function applySavedSearch(saved: SavedSearch) {
     mail.chips = {
       unread_only: !!f.unread_only,
       has_attachments: !!f.has_attachments,
+      flagged_only: !!f.flagged_only,
       from: f.from ?? '',
       days: f.date_from ? Math.max(1, Math.round((Date.now() / 1000 - f.date_from) / 86400)) : 0,
     }
@@ -267,4 +279,109 @@ export async function initMail() {
   } catch {
     // Offline: the locally cached folder list is all we need.
   }
+}
+
+export function wellKnownFolderId(name: string): string | null {
+  return mail.folders.find((f) => f.well_known_name === name)?.id ?? null
+}
+
+function patchLocalSummary(id: string, patch: Partial<MessageSummary>) {
+  mail.messages = mail.messages.map((m) => (m.id === id ? { ...m, ...patch } : m))
+  mail.hits = mail.hits.map((h) =>
+    h.entity_id === id && h.summary ? { ...h, summary: { ...h.summary, ...patch } } : h,
+  )
+}
+
+function removeLocal(id: string) {
+  mail.messages = mail.messages.filter((m) => m.id !== id)
+  mail.hits = mail.hits.filter((h) => h.entity_id !== id)
+  if (mail.selectedId === id) mail.selectedId = null
+}
+
+/** Immediate optimistic op (read/flag/categories/inference). The svelte list
+ *  updates instantly; if the shell (store + Graph) rejects it, we repaint
+ *  from the authoritative store, which already rolled back. */
+async function immediateOp(op: object, optimistic: () => void) {
+  optimistic()
+  try {
+    await invoke<string>('apply_op', { op })
+  } catch (e) {
+    mail.syncError = String(e)
+    await paintMessages() // store rolled back — resync the view
+  }
+}
+
+export function toggleRead(m: MessageSummary) {
+  const next = !m.is_read
+  void immediateOp({ kind: 'setRead', id: m.id, isRead: next }, () =>
+    patchLocalSummary(m.id, { is_read: next }),
+  )
+  void refreshCounts()
+}
+
+export function toggleFlag(m: MessageSummary) {
+  const next = m.flag_status === 'flagged' ? 'notFlagged' : 'flagged'
+  void immediateOp({ kind: 'setFlag', id: m.id, flagged: next === 'flagged' }, () =>
+    patchLocalSummary(m.id, { flag_status: next }),
+  )
+}
+
+export function setFocused(m: MessageSummary, focused: boolean) {
+  void immediateOp({ kind: 'setInference', id: m.id, focused }, () =>
+    patchLocalSummary(m.id, { inference_classification: focused ? 'focused' : 'other' }),
+  )
+}
+
+export async function setCategories(id: string, categories: string[]) {
+  await invoke('apply_op', { op: { kind: 'setCategories', id, categories } })
+}
+
+async function refreshCounts() {
+  const counts = await invoke<[string, number][]>('unread_counts')
+  mail.unread = Object.fromEntries(counts)
+}
+
+/** Undoable op (archive/delete/move): the row leaves the list immediately;
+ *  the shell shows the undo toast and fires Graph on lapse. */
+export async function queueMove(id: string, destFolderId: string, label: string) {
+  removeLocal(id)
+  try {
+    await invoke('queue_op', {
+      op: { kind: 'move', id, destFolderId },
+      label,
+    })
+  } catch (e) {
+    mail.syncError = String(e)
+    await paintMessages()
+  }
+}
+
+export async function archive(id: string) {
+  const dest = wellKnownFolderId('archive')
+  if (!dest) return
+  await queueMove(id, dest, 'archive')
+}
+
+export async function softDelete(id: string) {
+  const dest = wellKnownFolderId('deleteditems')
+  if (!dest) return
+  await queueMove(id, dest, 'delete')
+}
+
+export async function hardDelete(id: string) {
+  removeLocal(id)
+  try {
+    await invoke('queue_op', { op: { kind: 'hardDelete', id }, label: 'delete' })
+  } catch (e) {
+    mail.syncError = String(e)
+    await paintMessages()
+  }
+}
+
+/** Repaint the current view from the authoritative store — used after an
+ *  undone op restores a row, or a queued op fails and rolls back. */
+export async function refreshList() {
+  await paintMessages()
+  await refreshCounts()
+  if (searchActive()) await runSearch()
 }

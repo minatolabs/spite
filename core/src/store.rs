@@ -44,6 +44,11 @@ pub struct MessageSummary {
     pub preview: String,
     pub is_read: bool,
     pub has_attachments: bool,
+    /// Graph `flag.flagStatus`: notFlagged / flagged / complete.
+    pub flag_status: String,
+    /// Graph `inferenceClassification`: focused / other.
+    pub inference_classification: String,
+    pub is_draft: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -58,6 +63,8 @@ pub struct Message {
     pub body_content_type: Option<String>,
     /// RFC 5322 Message-ID — the dedupe key against server search hits.
     pub internet_message_id: Option<String>,
+    /// Assigned categories (Graph `categories`).
+    pub categories: Vec<String>,
 }
 
 /// Message-list filter chips; also usable without a query (filtered browse).
@@ -71,6 +78,8 @@ pub struct SearchFilters {
     pub from: Option<String>,
     pub date_from: Option<i64>,
     pub date_to: Option<i64>,
+    #[serde(default)]
+    pub flagged_only: bool,
 }
 
 impl SearchFilters {
@@ -78,6 +87,7 @@ impl SearchFilters {
         self.folder_id.is_none()
             && !self.unread_only
             && !self.has_attachments
+            && !self.flagged_only
             && self.from.is_none()
             && self.date_from.is_none()
             && self.date_to.is_none()
@@ -257,6 +267,22 @@ pub trait MailStore: Send + Sync {
         id: &str,
         internet_message_id: Option<&str>,
     ) -> Result<bool, MailStoreError>;
+
+    // --- Phase 7 optimistic write mutators. Each is a pure local state
+    // change; `ops::execute_op` pairs them with the Graph call + rollback. ---
+
+    fn set_read_state(&self, id: &str, is_read: bool) -> Result<(), MailStoreError>;
+    fn set_flag_status(&self, id: &str, flag_status: &str) -> Result<(), MailStoreError>;
+    fn set_categories(&self, id: &str, categories: &[String]) -> Result<(), MailStoreError>;
+    fn set_inference(&self, id: &str, classification: &str) -> Result<(), MailStoreError>;
+    /// Repoint a message at a folder (optimistic move). `new_id` lets a
+    /// confirmed Graph move swap in the destination-copy id.
+    fn move_message(
+        &self,
+        id: &str,
+        new_folder_id: &str,
+        new_id: Option<&str>,
+    ) -> Result<(), MailStoreError>;
 }
 
 fn migrations() -> Migrations<'static> {
@@ -387,6 +413,18 @@ fn migration_steps() -> Vec<M<'static>> {
         );
         UPDATE sync_state SET delta_link = NULL;",
         ),
+        // v6 (Phase 7): mail-management state. Flag/inference/categories/draft
+        // arrive with the widened sync $select; the cursor reset re-walks each
+        // window so existing rows backfill (idempotent upserts). Existing FTS
+        // triggers keep firing — the new columns aren't indexed, so no trigger
+        // change is needed.
+        M::up(
+            "ALTER TABLE messages ADD COLUMN flag_status TEXT NOT NULL DEFAULT 'notFlagged';
+        ALTER TABLE messages ADD COLUMN inference_classification TEXT NOT NULL DEFAULT 'focused';
+        ALTER TABLE messages ADD COLUMN categories TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE messages ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0;
+        UPDATE sync_state SET delta_link = NULL;",
+        ),
     ]
 }
 
@@ -468,6 +506,9 @@ impl SqliteMailStore {
             preview: row.get("preview")?,
             is_read: row.get("is_read")?,
             has_attachments: row.get("has_attachments")?,
+            flag_status: row.get("flag_status")?,
+            inference_classification: row.get("inference_classification")?,
+            is_draft: row.get("is_draft")?,
         })
     }
 }
@@ -524,8 +565,10 @@ impl MailStore for SqliteMailStore {
                 "INSERT INTO messages (id, folder_id, conversation_id, subject, from_name,
                                        from_address, received_at, preview, is_read,
                                        has_attachments, body_html, body_content_type,
-                                       internet_message_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                       internet_message_id, flag_status,
+                                       inference_classification, categories, is_draft)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         ?14, ?15, ?16, ?17)
                  ON CONFLICT(id) DO UPDATE SET
                      folder_id       = excluded.folder_id,
                      conversation_id = excluded.conversation_id,
@@ -540,7 +583,11 @@ impl MailStore for SqliteMailStore {
                      body_content_type =
                          COALESCE(excluded.body_content_type, messages.body_content_type),
                      internet_message_id =
-                         COALESCE(excluded.internet_message_id, messages.internet_message_id)",
+                         COALESCE(excluded.internet_message_id, messages.internet_message_id),
+                     flag_status              = excluded.flag_status,
+                     inference_classification = excluded.inference_classification,
+                     categories               = excluded.categories,
+                     is_draft                 = excluded.is_draft",
             )?;
             for m in messages {
                 let s = &m.summary;
@@ -558,6 +605,10 @@ impl MailStore for SqliteMailStore {
                     m.body_html,
                     m.body_content_type,
                     m.internet_message_id,
+                    s.flag_status,
+                    s.inference_classification,
+                    serde_json::to_string(&m.categories).unwrap_or_else(|_| "[]".to_string()),
+                    s.is_draft,
                 ])?;
             }
         }
@@ -574,7 +625,8 @@ impl MailStore for SqliteMailStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, folder_id, subject, from_name, from_address, received_at,
-                    preview, is_read, has_attachments
+                    preview, is_read, has_attachments, flag_status,
+                    inference_classification, is_draft
              FROM messages
              WHERE folder_id = ?1
              ORDER BY received_at DESC
@@ -591,8 +643,9 @@ impl MailStore for SqliteMailStore {
         let message = conn
             .query_row(
                 "SELECT id, folder_id, subject, from_name, from_address, received_at,
-                        preview, is_read, has_attachments, conversation_id, body_html,
-                        body_content_type, internet_message_id
+                        preview, is_read, has_attachments, flag_status,
+                        inference_classification, is_draft, conversation_id, body_html,
+                        body_content_type, internet_message_id, categories
                  FROM messages WHERE id = ?1",
                 params![id],
                 |row| {
@@ -602,6 +655,8 @@ impl MailStore for SqliteMailStore {
                         body_html: row.get("body_html")?,
                         body_content_type: row.get("body_content_type")?,
                         internet_message_id: row.get("internet_message_id")?,
+                        categories: serde_json::from_str(&row.get::<_, String>("categories")?)
+                            .unwrap_or_default(),
                     })
                 },
             )
@@ -814,6 +869,9 @@ impl MailStore for SqliteMailStore {
         if filters.has_attachments {
             preds.push_str(" AND m.has_attachments = 1");
         }
+        if filters.flagged_only {
+            preds.push_str(" AND m.flag_status = 'flagged'");
+        }
         if let Some(from) = filters.from.as_deref().filter(|f| !f.trim().is_empty()) {
             preds.push_str(" AND (m.from_address LIKE ? OR m.from_name LIKE ?)");
             let pat = format!("%{}%", from.trim());
@@ -833,7 +891,8 @@ impl MailStore for SqliteMailStore {
             // Filtered browse: no FTS, plain newest-first message query.
             let sql = format!(
                 "SELECT id, folder_id, subject, from_name, from_address, received_at,
-                        preview, is_read, has_attachments
+                        preview, is_read, has_attachments, flag_status,
+                        inference_classification, is_draft
                    FROM messages m
                   WHERE 1=1{preds}
                   ORDER BY received_at DESC
@@ -874,6 +933,7 @@ impl MailStore for SqliteMailStore {
                     CAST(s.ts AS INTEGER) AS ts_i,
                     m.id, m.folder_id, m.subject, m.from_name, m.from_address,
                     m.received_at, m.preview, m.is_read, m.has_attachments,
+                    m.flag_status, m.inference_classification, m.is_draft,
                     bm25(search_index, 0.0, 0.0, 4.0, 2.0, 1.0, 0.0)
                       + MIN(MAX(?4 - CAST(s.ts AS INTEGER), 0) / 86400.0, 365.0) * 0.01
                       AS score
@@ -910,6 +970,9 @@ impl MailStore for SqliteMailStore {
                             preview: row.get(11)?,
                             is_read: row.get(12)?,
                             has_attachments: row.get(13)?,
+                            flag_status: row.get(14)?,
+                            inference_classification: row.get(15)?,
+                            is_draft: row.get(16)?,
                         })
                     })
                     .transpose()?
@@ -1004,6 +1067,68 @@ impl MailStore for SqliteMailStore {
             |row| row.get(0),
         )?;
         Ok(exists)
+    }
+
+    fn set_read_state(&self, id: &str, is_read: bool) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET is_read = ?2 WHERE id = ?1",
+            params![id, is_read],
+        )?;
+        Ok(())
+    }
+
+    fn set_flag_status(&self, id: &str, flag_status: &str) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET flag_status = ?2 WHERE id = ?1",
+            params![id, flag_status],
+        )?;
+        Ok(())
+    }
+
+    fn set_categories(&self, id: &str, categories: &[String]) -> Result<(), MailStoreError> {
+        let json = serde_json::to_string(categories).unwrap_or_else(|_| "[]".to_string());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET categories = ?2 WHERE id = ?1",
+            params![id, json],
+        )?;
+        Ok(())
+    }
+
+    fn set_inference(&self, id: &str, classification: &str) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET inference_classification = ?2 WHERE id = ?1",
+            params![id, classification],
+        )?;
+        Ok(())
+    }
+
+    fn move_message(
+        &self,
+        id: &str,
+        new_folder_id: &str,
+        new_id: Option<&str>,
+    ) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        match new_id {
+            // Confirmed Graph move: the destination copy has a new id.
+            Some(dest) if dest != id => {
+                conn.execute(
+                    "UPDATE OR REPLACE messages SET id = ?2, folder_id = ?3 WHERE id = ?1",
+                    params![id, dest, new_folder_id],
+                )?;
+            }
+            _ => {
+                conn.execute(
+                    "UPDATE messages SET folder_id = ?2 WHERE id = ?1",
+                    params![id, new_folder_id],
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1248,6 +1373,7 @@ impl MailStore for MemoryMailStore {
             filters.folder_id.as_ref().is_none_or(|f| &s.folder_id == f)
                 && (!filters.unread_only || !s.is_read)
                 && (!filters.has_attachments || s.has_attachments)
+                && (!filters.flagged_only || s.flag_status == "flagged")
                 && filters.from.as_deref().is_none_or(|f| {
                     let f = f.to_lowercase();
                     s.from_address.to_lowercase().contains(&f)
@@ -1362,6 +1488,55 @@ impl MailStore for MemoryMailStore {
                     .any(|m| m.internet_message_id.as_deref() == Some(imid))
             }))
     }
+
+    fn set_read_state(&self, id: &str, is_read: bool) -> Result<(), MailStoreError> {
+        if let Some(m) = self.messages.lock().unwrap().get_mut(id) {
+            m.summary.is_read = is_read;
+        }
+        Ok(())
+    }
+
+    fn set_flag_status(&self, id: &str, flag_status: &str) -> Result<(), MailStoreError> {
+        if let Some(m) = self.messages.lock().unwrap().get_mut(id) {
+            m.summary.flag_status = flag_status.to_string();
+        }
+        Ok(())
+    }
+
+    fn set_categories(&self, id: &str, categories: &[String]) -> Result<(), MailStoreError> {
+        if let Some(m) = self.messages.lock().unwrap().get_mut(id) {
+            m.categories = categories.to_vec();
+        }
+        Ok(())
+    }
+
+    fn set_inference(&self, id: &str, classification: &str) -> Result<(), MailStoreError> {
+        if let Some(m) = self.messages.lock().unwrap().get_mut(id) {
+            m.summary.inference_classification = classification.to_string();
+        }
+        Ok(())
+    }
+
+    fn move_message(
+        &self,
+        id: &str,
+        new_folder_id: &str,
+        new_id: Option<&str>,
+    ) -> Result<(), MailStoreError> {
+        let mut map = self.messages.lock().unwrap();
+        if let Some(mut m) = map.remove(id) {
+            m.summary.folder_id = new_folder_id.to_string();
+            let key = match new_id {
+                Some(dest) => {
+                    m.summary.id = dest.to_string();
+                    dest.to_string()
+                }
+                None => id.to_string(),
+            };
+            map.insert(key, m);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1389,11 +1564,15 @@ mod tests {
                 preview: format!("preview {id}"),
                 is_read: false,
                 has_attachments: false,
+                flag_status: "notFlagged".to_string(),
+                inference_classification: "focused".to_string(),
+                is_draft: false,
             },
             conversation_id: None,
             body_html: body.map(str::to_string),
             body_content_type: body.map(|_| "html".to_string()),
             internet_message_id: Some(format!("{id}@mail.example")),
+            categories: Vec::new(),
         }
     }
 
@@ -1624,7 +1803,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
@@ -1852,6 +2031,80 @@ mod tests {
             .search("design", &SearchFilters::default(), 10)
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn write_mutators_and_flagged_filter() {
+        for store in [
+            Box::new(seeded_store()) as Box<dyn MailStore>,
+            Box::new({
+                let s = MemoryMailStore::default();
+                s.upsert_folders(&[folder("f1", "Inbox")]).unwrap();
+                s.upsert_messages(&[message("m1", "f1", 1_000, None)])
+                    .unwrap();
+                s
+            }),
+        ] {
+            // Read state.
+            store.set_read_state("m1", true).unwrap();
+            assert!(store.get_message("m1").unwrap().unwrap().summary.is_read);
+            store.set_read_state("m1", false).unwrap();
+            assert!(!store.get_message("m1").unwrap().unwrap().summary.is_read);
+
+            // Flag status + the flagged filter (Phase 6's disabled chip).
+            store.set_flag_status("m1", "flagged").unwrap();
+            let f = SearchFilters {
+                flagged_only: true,
+                ..Default::default()
+            };
+            let hits = store.search("", &f, 10).unwrap();
+            assert!(hits.iter().any(|h| h.entity_id == "m1"));
+            store.set_flag_status("m1", "notFlagged").unwrap();
+            assert!(store.search("", &f, 10).unwrap().is_empty());
+
+            // Categories.
+            store
+                .set_categories("m1", &["Red".to_string(), "Work".to_string()])
+                .unwrap();
+            assert_eq!(
+                store.get_message("m1").unwrap().unwrap().categories,
+                vec!["Red".to_string(), "Work".to_string()]
+            );
+
+            // Inference (focused/other).
+            store.set_inference("m1", "other").unwrap();
+            assert_eq!(
+                store
+                    .get_message("m1")
+                    .unwrap()
+                    .unwrap()
+                    .summary
+                    .inference_classification,
+                "other"
+            );
+
+            // Move with id reconciliation: old id gone, new id in new folder.
+            store
+                .upsert_folders(&[folder("archive", "Archive")])
+                .unwrap();
+            store
+                .move_message("m1", "archive", Some("m1-moved"))
+                .unwrap();
+            assert!(store.get_message("m1").unwrap().is_none());
+            let moved = store.get_message("m1-moved").unwrap().unwrap();
+            assert_eq!(moved.summary.folder_id, "archive");
+            // Plain move (no new id) just repoints the folder.
+            store.move_message("m1-moved", "f1", None).unwrap();
+            assert_eq!(
+                store
+                    .get_message("m1-moved")
+                    .unwrap()
+                    .unwrap()
+                    .summary
+                    .folder_id,
+                "f1"
+            );
+        }
     }
 
     #[test]

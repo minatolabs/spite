@@ -1,6 +1,14 @@
 <script lang="ts">
-  import { CloudDownload } from 'lucide-svelte'
-  import { loadMore, mail, searchActive, type MessageSummary } from './mail.svelte'
+  import { CloudDownload, Flag } from 'lucide-svelte'
+  import { loadMore, mail, searchActive, selectedFolder, type MessageSummary } from './mail.svelte'
+
+  // Focused/Other tabs apply only to the Inbox browse view.
+  let showFocusTabs = $derived(!searchActive() && selectedFolder()?.well_known_name === 'inbox')
+  let browseRows = $derived.by(() =>
+    mail.focusTab === 'all'
+      ? mail.messages
+      : mail.messages.filter((m) => m.inference_classification === mail.focusTab),
+  )
 
   /** Split highlighted text on the private-use markers the store emits.
    *  Rendering happens via DOM text nodes + <mark> elements — never HTML. */
@@ -107,7 +115,19 @@
       <p class="hint">Thin local results — try “Everywhere” for a deep server search.</p>
     {/if}
   {:else}
-    {#each mail.messages as m (m.id)}
+    {#if showFocusTabs}
+      <div class="focus-tabs">
+        <button class:on={mail.focusTab === 'all'} onclick={() => (mail.focusTab = 'all')}>All</button>
+        <button
+          class:on={mail.focusTab === 'focused'}
+          onclick={() => (mail.focusTab = 'focused')}>Focused</button
+        >
+        <button class:on={mail.focusTab === 'other'} onclick={() => (mail.focusTab = 'other')}
+          >Other</button
+        >
+      </div>
+    {/if}
+    {#each browseRows as m (m.id)}
       <button
         class="row"
         class:unread={!m.is_read}
@@ -117,15 +137,18 @@
         <span class="top">
           <span class="sp-led" class:sp-led--off={m.is_read}></span>
           <span class="from">{m.from_name || m.from_address || '(unknown sender)'}</span>
+          {#if m.flag_status === 'flagged'}<Flag size={11} class="flag" />{/if}
           <span class="time">{fmtTime(m.received_at)}</span>
         </span>
         <span class="subject">{m.subject || '(no subject)'}</span>
         <span class="preview">{m.preview}</span>
       </button>
     {:else}
-      <p class="empty">No messages in this folder yet.</p>
+      <p class="empty">
+        {mail.focusTab === 'all' ? 'No messages in this folder yet.' : `No ${mail.focusTab} messages.`}
+      </p>
     {/each}
-    {#if mail.hasMore}
+    {#if mail.hasMore && mail.focusTab === 'all'}
       <button class="sp-btn more" onclick={() => void loadMore()}>Load more</button>
     {/if}
   {/if}
@@ -135,6 +158,33 @@
   .messages {
     display: flex;
     flex-direction: column;
+  }
+
+  .focus-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--sp-border-hard);
+    background: var(--sp-surface-sunken);
+  }
+
+  .focus-tabs button {
+    flex: 1;
+    padding: var(--sp-2);
+    border: none;
+    background: transparent;
+    color: var(--sp-text-secondary);
+    font: 500 var(--sp-fs-small) / 1 var(--sp-font-ui);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+  }
+
+  .focus-tabs button.on {
+    color: var(--sp-text-display);
+    border-bottom-color: var(--sp-accent-edge);
+  }
+
+  :global(.flag) {
+    color: var(--sp-flag);
+    flex: none;
   }
 
   .row {
