@@ -51,6 +51,32 @@
     message = null
   }
 
+  // Reading-pane action wrappers: flip the local `message` optimistically too
+  // (the store helpers update the list, not this pane's copy), so the button
+  // reflects the change instantly.
+  function readToggle() {
+    if (!message) return
+    const s = message.summary
+    toggleRead(s)
+    message = { ...message, summary: { ...s, is_read: !s.is_read } }
+  }
+  function flagToggle() {
+    if (!message) return
+    const s = message.summary
+    const next = s.flag_status === 'flagged' ? 'notFlagged' : 'flagged'
+    toggleFlag(s)
+    message = { ...message, summary: { ...s, flag_status: next } }
+  }
+  function focusMove(focused: boolean) {
+    if (!message) return
+    const s = message.summary
+    setFocused(s, focused)
+    message = {
+      ...message,
+      summary: { ...s, inference_classification: focused ? 'focused' : 'other' },
+    }
+  }
+
   let message: Message | null = $state(null)
   let body: MessageBody | null = $state(null)
   let bodyState: 'idle' | 'loading' | 'ready' | 'unavailable' = $state('idle')
@@ -189,7 +215,7 @@
           <span class="gap"></span>
           <button
             class="sp-btn"
-            onclick={() => message && toggleRead(message.summary)}
+            onclick={readToggle}
             title={message.summary.is_read ? 'Mark unread' : 'Mark read'}
           >
             {#if message.summary.is_read}<Mail size={13} />{:else}<MailOpen size={13} />{/if}
@@ -197,7 +223,7 @@
           <button
             class="sp-btn"
             class:flagged={message.summary.flag_status === 'flagged'}
-            onclick={() => message && toggleFlag(message.summary)}
+            onclick={flagToggle}
             title="Flag"
           >
             <Flag size={13} />
@@ -227,13 +253,11 @@
             <Trash2 size={13} />
           </button>
           {#if message.summary.inference_classification === 'other'}
-            <button class="sp-btn" onclick={() => message && setFocused(message.summary, true)}>
+            <button class="sp-btn" onclick={() => focusMove(true)}>
               <Inbox size={13} /> Move to Focused
             </button>
           {:else}
-            <button class="sp-btn" onclick={() => message && setFocused(message.summary, false)}>
-              Move to Other
-            </button>
+            <button class="sp-btn" onclick={() => focusMove(false)}>Move to Other</button>
           {/if}
         </p>
         <p class="categories">

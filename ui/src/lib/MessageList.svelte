@@ -60,6 +60,7 @@
         class="row"
         class:unread={s ? !s.is_read : false}
         class:selected={hit.entity_id === mail.selectedId}
+        data-message-id={s ? s.id : undefined}
         onclick={() => s && selectLocal(s.id)}
       >
         <span class="top">
@@ -132,6 +133,7 @@
         class="row"
         class:unread={!m.is_read}
         class:selected={m.id === mail.selectedId}
+        data-message-id={m.id}
         onclick={() => selectLocal(m.id)}
       >
         <span class="top">

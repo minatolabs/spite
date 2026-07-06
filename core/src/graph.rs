@@ -153,6 +153,7 @@ impl GraphMailSource {
                 .await
                 .map_err(|e| SourceError::Http(e.to_string()))?;
             let status = resp.status().as_u16();
+            let method = resp.url().path().to_string();
             match status {
                 401 if attempt == 0 => {
                     self.auth.invalidate_session().await;
@@ -161,10 +162,11 @@ impl GraphMailSource {
                 401 => return Err(SourceError::Unauthorized),
                 // A write rejected for consent (revoked scope) surfaces clearly.
                 403 => {
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!(path = %method, body = %body, "graph write 403 (missing Mail.ReadWrite consent?)");
                     return Err(SourceError::Http(format!(
-                        "403 access denied — Spite may need mail-management \
-                         permission re-granted: {}",
-                        resp.text().await.unwrap_or_default()
+                        "403 access denied — Spite needs mail-management permission \
+                         re-granted (sign out and back in): {body}"
                     )));
                 }
                 429 => {
@@ -179,12 +181,14 @@ impl GraphMailSource {
                     });
                 }
                 s if !(200..300).contains(&s) => {
-                    return Err(SourceError::Http(format!(
-                        "{s}: {}",
-                        resp.text().await.unwrap_or_default()
-                    )));
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::warn!(path = %method, status = s, body = %body, "graph write failed");
+                    return Err(SourceError::Http(format!("{s}: {body}")));
                 }
-                _ => return Ok(resp),
+                s => {
+                    tracing::debug!(path = %method, status = s, "graph write ok");
+                    return Ok(resp);
+                }
             }
         }
         unreachable!("the 401-retry loop always returns within two attempts")

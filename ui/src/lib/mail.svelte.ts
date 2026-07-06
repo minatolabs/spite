@@ -88,6 +88,9 @@ export const mail = $state({
   serverSelected: null as MessageSummary | null,
   /// Transient status-bar flash (e.g. stubbed keyboard verbs).
   flash: '',
+  /// A failed mail-management action (surfaced as a dismissable banner) —
+  /// distinct from `syncError` so write failures aren't mislabeled "offline".
+  actionError: '',
 })
 
 let flashTimer: ReturnType<typeof setTimeout> | undefined
@@ -302,12 +305,16 @@ function removeLocal(id: string) {
  *  updates instantly; if the shell (store + Graph) rejects it, we repaint
  *  from the authoritative store, which already rolled back. */
 async function immediateOp(op: object, optimistic: () => void) {
+  mail.actionError = ''
   optimistic()
   try {
     await invoke<string>('apply_op', { op })
   } catch (e) {
-    mail.syncError = String(e)
-    await paintMessages() // store rolled back — resync the view
+    // Surface the failure loudly — the store already rolled back, so repaint
+    // to match, and tell the user rather than swallowing it.
+    mail.actionError = String(e)
+    await paintMessages()
+    await refreshCounts()
   }
 }
 
@@ -315,8 +322,7 @@ export function toggleRead(m: MessageSummary) {
   const next = !m.is_read
   void immediateOp({ kind: 'setRead', id: m.id, isRead: next }, () =>
     patchLocalSummary(m.id, { is_read: next }),
-  )
-  void refreshCounts()
+  ).then(() => refreshCounts())
 }
 
 export function toggleFlag(m: MessageSummary) {
@@ -333,7 +339,13 @@ export function setFocused(m: MessageSummary, focused: boolean) {
 }
 
 export async function setCategories(id: string, categories: string[]) {
-  await invoke('apply_op', { op: { kind: 'setCategories', id, categories } })
+  mail.actionError = ''
+  try {
+    await invoke('apply_op', { op: { kind: 'setCategories', id, categories } })
+  } catch (e) {
+    mail.actionError = String(e)
+    await paintMessages()
+  }
 }
 
 async function refreshCounts() {
@@ -344,6 +356,7 @@ async function refreshCounts() {
 /** Undoable op (archive/delete/move): the row leaves the list immediately;
  *  the shell shows the undo toast and fires Graph on lapse. */
 export async function queueMove(id: string, destFolderId: string, label: string) {
+  mail.actionError = ''
   removeLocal(id)
   try {
     await invoke('queue_op', {
@@ -351,7 +364,7 @@ export async function queueMove(id: string, destFolderId: string, label: string)
       label,
     })
   } catch (e) {
-    mail.syncError = String(e)
+    mail.actionError = String(e)
     await paintMessages()
   }
 }
@@ -369,11 +382,12 @@ export async function softDelete(id: string) {
 }
 
 export async function hardDelete(id: string) {
+  mail.actionError = ''
   removeLocal(id)
   try {
     await invoke('queue_op', { op: { kind: 'hardDelete', id }, label: 'delete' })
   } catch (e) {
-    mail.syncError = String(e)
+    mail.actionError = String(e)
     await paintMessages()
   }
 }

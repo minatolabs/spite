@@ -146,6 +146,8 @@
         event.preventDefault()
       }
     })
+    // The default context menu is suppressed app-wide in App.svelte (which is
+    // the root of this window too), keeping the native menu in editable fields.
     return () => {
       void unlistenPromise.then((fn) => fn())
     }

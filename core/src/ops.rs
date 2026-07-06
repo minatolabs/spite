@@ -31,8 +31,18 @@ pub enum OpError {
 
 /// A single mail-management operation. Carries only its inputs; the previous
 /// state needed for rollback is captured from the store at execution time.
+// `rename_all` renames the variant names (SetRead → setRead, matching the
+// `kind` tag from JS); `rename_all_fields` is REQUIRED to also camelCase the
+// struct-variant fields (is_read → isRead, dest_folder_id → destFolderId).
+// Without the latter, ops carrying multi-word fields fail to deserialize
+// before ever reaching Graph — the bug that made mark-read/move/archive/
+// delete silently do nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum MailOp {
     SetRead {
         id: String,
@@ -550,6 +560,40 @@ mod tests {
             before,
             "hard-delete rollback resurrects the message"
         );
+    }
+
+    #[test]
+    fn ops_deserialize_from_the_ui_camelcase_payloads() {
+        // These are the exact JSON shapes the Svelte layer sends. Field names
+        // are camelCase; they MUST map onto the snake_case Rust fields.
+        type Check = fn(&MailOp) -> bool;
+        let cases: &[(&str, Check)] = &[
+            (
+                r#"{"kind":"setRead","id":"m1","isRead":true}"#,
+                |op| matches!(op, MailOp::SetRead { id, is_read: true } if id == "m1"),
+            ),
+            (r#"{"kind":"setFlag","id":"m1","flagged":true}"#, |op| {
+                matches!(op, MailOp::SetFlag { flagged: true, .. })
+            }),
+            (
+                r#"{"kind":"setInference","id":"m1","focused":false}"#,
+                |op| matches!(op, MailOp::SetInference { focused: false, .. }),
+            ),
+            (
+                r#"{"kind":"move","id":"m1","destFolderId":"archive"}"#,
+                |op| matches!(op, MailOp::Move { dest_folder_id, .. } if dest_folder_id == "archive"),
+            ),
+            (
+                r#"{"kind":"hardDelete","id":"m1"}"#,
+                |op| matches!(op, MailOp::HardDelete { id } if id == "m1"),
+            ),
+        ];
+        for (json, check) in cases {
+            let op: MailOp = serde_json::from_str(json).unwrap_or_else(|e| {
+                panic!("failed to deserialize {json}: {e}");
+            });
+            assert!(check(&op), "unexpected variant for {json}: {op:?}");
+        }
     }
 
     #[tokio::test]

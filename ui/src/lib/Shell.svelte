@@ -5,6 +5,7 @@
   import { LogOut, PenLine, RefreshCw, Settings2 } from 'lucide-svelte'
   import FilterChips from './FilterChips.svelte'
   import FolderTree from './FolderTree.svelte'
+  import MailContextMenu from './MailContextMenu.svelte'
   import MessageList from './MessageList.svelte'
   import ReadingPane from './ReadingPane.svelte'
   import SearchBar from './SearchBar.svelte'
@@ -178,6 +179,14 @@
   {/if}
 
   <SendToasts />
+  <MailContextMenu />
+
+  {#if mail.actionError}
+    <div class="action-error" role="alert">
+      <span>{mail.actionError}</span>
+      <button onclick={() => (mail.actionError = '')} aria-label="Dismiss">×</button>
+    </div>
+  {/if}
 
   <div class="panes">
     <aside class="folders sp-scroll">
@@ -202,6 +211,32 @@
     height: 100svh;
     display: grid;
     grid-template-rows: var(--sp-h-toolbar) 1fr var(--sp-h-statusbar);
+  }
+
+  .action-error {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    padding: var(--sp-2) var(--sp-4);
+    font-size: var(--sp-fs-small);
+    color: var(--sp-text-on-accent);
+    background: var(--sp-danger);
+    border-bottom: 1px solid var(--sp-border-hard);
+  }
+
+  .action-error span {
+    flex: 1;
+    overflow-wrap: anywhere;
+  }
+
+  .action-error button {
+    border: none;
+    background: none;
+    color: inherit;
+    font-size: var(--sp-fs-title);
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 var(--sp-1);
   }
 
   .toolbar {

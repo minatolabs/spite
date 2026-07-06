@@ -28,6 +28,15 @@
       prompt = event.payload
     }).then((fn) => (unlisten = fn))
 
+    // Baseline: suppress the browser's default right-click menu app-wide
+    // (no Back/Forward/Reload/Inspect), keeping it only in editable fields.
+    // MailContextMenu adds the custom mail menu on message rows on top.
+    const suppressMenu = (e: MouseEvent) => {
+      const el = e.target as HTMLElement
+      if (!el.closest('input, textarea, [contenteditable="true"]')) e.preventDefault()
+    }
+    window.addEventListener('contextmenu', suppressMenu)
+
     invoke<Account>('silent_sign_in')
       .then((a) => (account = a))
       .catch((e) => {
@@ -40,7 +49,10 @@
       })
       .finally(() => (checking = false))
 
-    return () => unlisten?.()
+    return () => {
+      unlisten?.()
+      window.removeEventListener('contextmenu', suppressMenu)
+    }
   })
 
   async function signIn() {
