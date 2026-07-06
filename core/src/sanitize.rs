@@ -39,6 +39,60 @@ pub fn sanitize_html(dirty: &str) -> String {
     SANITIZER.clean(dirty).to_string()
 }
 
+/// Reduce HTML to plain text for full-text indexing: tags dropped, common
+/// entities decoded, whitespace collapsed. Not a sanitizer — it feeds the
+/// FTS index (via the `strip_html` SQL function), where the only job is
+/// making sure `<div>` and friends never become search tokens.
+pub fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut chars = html.chars().peekable();
+    let mut in_tag = false;
+    while let Some(c) = chars.next() {
+        if in_tag {
+            if c == '>' {
+                in_tag = false;
+                out.push(' '); // tag boundaries separate tokens
+            }
+            continue;
+        }
+        match c {
+            '<' => in_tag = true,
+            '&' => {
+                let mut entity = String::new();
+                let mut terminated = false;
+                while let Some(&nc) = chars.peek() {
+                    if nc == ';' {
+                        chars.next();
+                        terminated = true;
+                        break;
+                    }
+                    if entity.len() >= 8 || nc == '&' || nc == '<' || nc.is_whitespace() {
+                        break;
+                    }
+                    entity.push(nc);
+                    chars.next();
+                }
+                match entity.as_str() {
+                    "amp" => out.push('&'),
+                    "lt" => out.push('<'),
+                    "gt" => out.push('>'),
+                    "quot" | "#34" => out.push('"'),
+                    "apos" | "#39" => out.push('\''),
+                    "nbsp" | "#160" => out.push(' '),
+                    other if !terminated => {
+                        // Not an entity after all — keep the literal text.
+                        out.push('&');
+                        out.push_str(other);
+                    }
+                    _ => {} // unknown entity: drop rather than pollute tokens
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +197,24 @@ mod tests {
     fn sanitize_is_idempotent() {
         let once = sanitize_html(r#"<p>hi <b>there</b></p><script>x</script>"#);
         assert_eq!(once, sanitize_html(&once));
+    }
+
+    #[test]
+    fn html_to_text_strips_tags_and_decodes_entities() {
+        assert_eq!(
+            html_to_text("<div><p>Hello <b>world</b></p><br>next&nbsp;line</div>"),
+            "Hello world next line"
+        );
+        assert_eq!(
+            html_to_text("a &amp; b &lt;c&gt; &quot;d&quot;"),
+            "a & b <c> \"d\""
+        );
+        // No tag names leak into index text.
+        let text = html_to_text("<table><tr><td>cell</td></tr></table>");
+        assert!(!text.contains("table") && !text.contains("td"), "{text}");
+        assert_eq!(text, "cell");
+        // Bare ampersands survive as text.
+        assert_eq!(html_to_text("Fish & Chips"), "Fish & Chips");
+        assert_eq!(html_to_text(""), "");
     }
 }

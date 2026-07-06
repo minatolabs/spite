@@ -3,13 +3,15 @@
   import { invoke } from '@tauri-apps/api/core'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { LogOut, PenLine, RefreshCw, Settings2 } from 'lucide-svelte'
+  import FilterChips from './FilterChips.svelte'
   import FolderTree from './FolderTree.svelte'
   import MessageList from './MessageList.svelte'
   import ReadingPane from './ReadingPane.svelte'
+  import SearchBar from './SearchBar.svelte'
   import SendToasts from './SendToasts.svelte'
   import SignatureSettings from './SignatureSettings.svelte'
   import StatusBar from './StatusBar.svelte'
-  import { initMail, mail, selectedFolder, syncNow } from './mail.svelte'
+  import { clearSearch, flash, initMail, mail, searchActive, selectedFolder, syncNow } from './mail.svelte'
 
   type Account = { upn: string; display_name: string }
   let { account, onsignout }: { account: Account; onsignout: () => void } = $props()
@@ -20,8 +22,95 @@
     void invoke('open_compose', { mode: 'new', messageId: null })
   }
 
+  // Vim-flavored, read-only this phase; write verbs are stubs until the
+  // mail-management phase. Overridable via config.json { "keymap": {...} }.
+  let keymap = $state<Record<string, string>>({
+    focusSearch: '/',
+    next: 'j',
+    prev: 'k',
+    open: 'Enter',
+    clear: 'Escape',
+    reply: 'r',
+    compose: 'c',
+    archive: 'e',
+    delete: '#',
+    flag: 's',
+  })
+
+  function visibleIds(): string[] {
+    if (searchActive()) {
+      return [
+        ...mail.hits.filter((h) => h.summary).map((h) => h.entity_id),
+        ...mail.serverHits.map((h) => h.summary.id),
+      ]
+    }
+    return mail.messages.map((m) => m.id)
+  }
+
+  function moveSelection(delta: number) {
+    const ids = visibleIds()
+    if (!ids.length) return
+    const at = mail.selectedId ? ids.indexOf(mail.selectedId) : -1
+    const next = ids[Math.min(Math.max(at + delta, 0), ids.length - 1)]
+    const server = mail.serverHits.find((h) => h.summary.id === next)
+    mail.serverSelected = server ? server.summary : null
+    mail.selectedId = next
+  }
+
+  function isTyping(target: EventTarget | null): boolean {
+    const el = target as HTMLElement | null
+    return (
+      !!el &&
+      (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+    )
+  }
+
+  function onGlobalKeydown(e: KeyboardEvent) {
+    if (e.ctrlKey || e.metaKey || e.altKey || isTyping(e.target)) return
+    const key = e.key
+    if (key === keymap.focusSearch) {
+      e.preventDefault()
+      document.getElementById('search-input')?.focus()
+    } else if (key === keymap.next) {
+      e.preventDefault()
+      moveSelection(1)
+    } else if (key === keymap.prev) {
+      e.preventDefault()
+      moveSelection(-1)
+    } else if (key === keymap.open) {
+      // Selection already opens in the reading pane; Enter is a no-op
+      // confirm so the muscle memory works.
+      if (mail.selectedId) e.preventDefault()
+    } else if (key === keymap.clear) {
+      if (searchActive()) {
+        e.preventDefault()
+        clearSearch()
+      }
+    } else if (key === keymap.reply) {
+      if (mail.selectedId) {
+        e.preventDefault()
+        void invoke('open_compose', { mode: 'reply', messageId: mail.selectedId })
+      }
+    } else if (key === keymap.compose) {
+      e.preventDefault()
+      composeNew()
+    } else if (key === keymap.archive) {
+      e.preventDefault()
+      flash('Archive needs mail management — a later phase')
+    } else if (key === keymap.delete) {
+      e.preventDefault()
+      flash('Delete needs mail management — a later phase')
+    } else if (key === keymap.flag) {
+      e.preventDefault()
+      flash('Flag needs mail management — a later phase')
+    }
+  }
+
   onMount(() => {
     void initMail()
+    invoke<Record<string, string>>('get_keymap')
+      .then((overrides) => (keymap = { ...keymap, ...overrides }))
+      .catch(() => {})
     // UI-driven sync (replaces the Phase 3 startup trigger): folder open
     // (in selectFolder), window focus, and a 60s interval.
     const interval = setInterval(() => void syncNow(), 60_000)
@@ -38,6 +127,8 @@
   })
 </script>
 
+<svelte:window onkeydown={onGlobalKeydown} />
+
 <div class="shell">
   <header class="toolbar">
     <span class="wordmark">SPITE</span>
@@ -46,6 +137,7 @@
     </button>
     <span class="folder-name">{selectedFolder()?.display_name ?? ''}</span>
     <span class="spacer"></span>
+    <SearchBar />
     <button
       class="sp-btn"
       onclick={() => void syncNow()}
@@ -74,8 +166,11 @@
     <aside class="folders sp-scroll">
       <FolderTree />
     </aside>
-    <section class="list sp-scroll">
-      <MessageList />
+    <section class="list-pane">
+      <FilterChips />
+      <div class="list sp-scroll">
+        <MessageList />
+      </div>
     </section>
     <section class="reading">
       <ReadingPane />
@@ -137,10 +232,17 @@
     padding: var(--sp-3) 0;
   }
 
-  .list {
+  .list-pane {
+    display: flex;
+    flex-direction: column;
     background: var(--sp-surface-sunken);
     border-right: 1px solid var(--sp-border-hard);
     box-shadow: var(--sp-seam-right);
+    min-height: 0;
+  }
+
+  .list {
+    flex: 1;
     overflow-y: auto;
     min-height: 0;
   }

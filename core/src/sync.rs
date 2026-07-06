@@ -299,6 +299,7 @@ mod tests {
             conversation_id: None,
             body_html: None,
             body_content_type: None,
+            internet_message_id: None,
         }
     }
 

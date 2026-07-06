@@ -2,6 +2,7 @@
 //! so users can bring their own app registration (or point authority at a
 //! single tenant for testing) without a code change.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,9 @@ pub struct AppConfig {
     pub backfill_count: u32,
     /// Undo-send delay in seconds (clamped to 0..=120; 0 sends immediately).
     pub undo_send_seconds: u32,
+    /// Keyboard-shortcut overrides (action name → key); unlisted actions
+    /// keep the vim-flavored defaults defined in the UI.
+    pub keymap: HashMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -37,6 +41,7 @@ impl Default for AppConfig {
             db_path: None,
             backfill_count: DEFAULT_BACKFILL_COUNT,
             undo_send_seconds: DEFAULT_UNDO_SEND_SECONDS,
+            keymap: HashMap::new(),
         }
     }
 }
@@ -49,6 +54,7 @@ struct ConfigOverrides {
     db_path: Option<PathBuf>,
     backfill_count: Option<u32>,
     undo_send_seconds: Option<u32>,
+    keymap: Option<HashMap<String, String>>,
 }
 
 impl AppConfig {
@@ -73,6 +79,9 @@ impl AppConfig {
                     }
                     if let Some(v) = overrides.undo_send_seconds {
                         cfg.undo_send_seconds = v;
+                    }
+                    if let Some(v) = overrides.keymap {
+                        cfg.keymap = v;
                     }
                 }
                 Err(e) => eprintln!("spite: ignoring malformed {}: {e}", path.display()),
@@ -158,5 +167,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(AppConfig::load(dir.path()).undo_send_seconds, 30);
+    }
+
+    #[test]
+    fn keymap_overrides_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(AppConfig::load(dir.path()).keymap.is_empty());
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            r#"{ "keymap": { "focusSearch": "s", "next": "n" } }"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load(dir.path());
+        assert_eq!(cfg.keymap.get("focusSearch").map(String::as_str), Some("s"));
+        assert_eq!(cfg.keymap.get("next").map(String::as_str), Some("n"));
     }
 }

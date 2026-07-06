@@ -6,10 +6,11 @@ use spite_core::auth::token_store::KeyringTokenStore;
 use spite_core::auth::{Account, Authenticator, DeviceCodePrompt};
 use spite_core::compose::{self, ComposeMode, Draft, EmailAddress};
 use spite_core::config::AppConfig;
-use spite_core::graph::GraphMailSource;
+use spite_core::graph::{GraphMailSource, ServerHit};
 use spite_core::sanitize::sanitize_html;
 use spite_core::store::{
-    Folder, MailStore, MailStoreError, Message, MessageSummary, SqliteMailStore, SyncState,
+    build_kql, Folder, MailStore, MailStoreError, Message, MessageSummary, SavedSearch,
+    SearchFilters, SearchHit, SqliteMailStore, SyncState,
 };
 use spite_core::sync::{sync_folder as run_sync_folder, SyncReport};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -164,17 +165,18 @@ async fn fetch_message_body(
     auth: State<'_, Arc<Authenticator>>,
     store: State<'_, Arc<dyn MailStore>>,
 ) -> Result<MessageBody, String> {
+    // `None` = not in the local store (e.g. a server-search hit outside the
+    // sync window) — still fetchable, just not cached below.
     let cached = {
         let id = id.clone();
         store_call(&store, move |s| s.get_message(&id)).await?
-    }
-    .ok_or_else(|| "message not found".to_string())?;
+    };
 
-    if let Some(body) = cached.body_html {
+    if let Some(body) = cached.as_ref().and_then(|m| m.body_html.clone()) {
         return Ok(MessageBody {
             body,
             content_type: cached
-                .body_content_type
+                .and_then(|m| m.body_content_type)
                 .unwrap_or_else(|| "html".to_string()),
         });
     }
@@ -190,7 +192,9 @@ async fn fetch_message_body(
         (fetched.content, "text".to_string())
     };
 
-    {
+    // Cache only for locally-synced messages; a server-search hit outside
+    // the sync window (cached == None) is returned without persisting.
+    if cached.is_some() {
         let (id, body, ct) = (id.clone(), body.clone(), content_type.clone());
         store_call(&store, move |s| s.set_message_body(&id, &body, &ct)).await?;
     }
@@ -589,6 +593,77 @@ async fn perform_send(app: &AppHandle, id: u64) {
     }
 }
 
+/// Instant local search (FTS5): ranked, highlighted, offline. Empty query
+/// with filters = filtered browse.
+#[tauri::command]
+async fn search_local(
+    query: String,
+    filters: SearchFilters,
+    limit: u32,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<SearchHit>, String> {
+    store_call(&store, move |s| s.search(&query, &filters, limit)).await
+}
+
+/// Deep server search over the whole mailbox, deduped against local rows by
+/// Graph id and internetMessageId. `Mail.Read` only.
+#[tauri::command]
+async fn search_server(
+    query: String,
+    filters: SearchFilters,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<ServerHit>, String> {
+    let kql = build_kql(&query, &filters);
+    if kql.is_empty() {
+        return Ok(vec![]);
+    }
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    let hits = source
+        .search_messages(&kql, 25)
+        .await
+        .map_err(|e| e.to_string())?;
+    store_call(&store, move |s| {
+        let mut fresh = Vec::new();
+        for hit in hits {
+            if !s.message_exists(&hit.summary.id, hit.internet_message_id.as_deref())? {
+                fresh.push(hit);
+            }
+        }
+        Ok(fresh)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_saved_searches(
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<SavedSearch>, String> {
+    store_call(&store, |s| s.list_saved_searches()).await
+}
+
+#[tauri::command]
+async fn save_search(
+    name: String,
+    query: String,
+    filters: SearchFilters,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<i64, String> {
+    let filters_json = serde_json::to_string(&filters).map_err(|e| e.to_string())?;
+    store_call(&store, move |s| s.save_search(&name, &query, &filters_json)).await
+}
+
+#[tauri::command]
+async fn delete_saved_search(id: i64, store: State<'_, Arc<dyn MailStore>>) -> Result<(), String> {
+    store_call(&store, move |s| s.delete_saved_search(id)).await
+}
+
+/// Keyboard-shortcut overrides from config.json (UI merges over defaults).
+#[tauri::command]
+fn get_keymap(config: State<'_, AppConfig>) -> std::collections::HashMap<String, String> {
+    config.keymap.clone()
+}
+
 #[tauri::command]
 async fn autocomplete_recipients(
     query: String,
@@ -708,7 +783,13 @@ pub fn run() {
             undo_send,
             autocomplete_recipients,
             get_signature,
-            set_signature
+            set_signature,
+            search_local,
+            search_server,
+            list_saved_searches,
+            save_search,
+            delete_saved_search,
+            get_keymap
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

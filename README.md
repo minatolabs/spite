@@ -86,6 +86,26 @@ Manager), never on disk.
   limitation: Outlook's roaming signatures are not exposed to third-party
   clients at all.
 
+## Search
+
+- **Local-first**: instant, ranked, highlighted full-text search (SQLite
+  FTS5, diacritic-insensitive, search-as-you-type) over subjects, senders,
+  and cached bodies — fully offline. The index is entity-agnostic
+  (`search_index` with an `entity_type` column), so calendar/contact search
+  can plug in later without a rebuild.
+- **Filters**: unread, attachment, date range, and from — over both search
+  results and normal browsing. (The flagged chip is disabled until flag
+  data syncs in the mail-management phase.) Searches can be saved and
+  reapplied from the bookmark menu.
+- **Server fallback**: "Everywhere" runs a deep KQL search over the whole
+  mailbox via `GET /me/messages?$search` (works for personal accounts,
+  unlike `/search/query`; still `Mail.Read`), deduplicated against local
+  results by Graph id and `internetMessageId`.
+- **Keyboard** (vim-flavored; override in `config.json` under `"keymap"`):
+  `/` search, `j`/`k` navigate, `Enter` open, `Esc` clear, `r` reply,
+  `c` compose. `e`/`#`/`s` (archive/delete/flag) are stubs until the
+  mail-management phase.
+
 ## Linux notes
 
 WebKitGTK's accelerated compositing is crash-prone on some driver and

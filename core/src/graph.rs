@@ -48,9 +48,10 @@ pub async fn get_me(http: &reqwest::Client, access_token: &str) -> Result<Me, Gr
 }
 
 /// Summary fields synced into the local store. Bodies are deliberately
-/// excluded (lazy-loaded on open, Phase 4).
-pub const MESSAGE_SELECT: &str =
-    "id,subject,from,receivedDateTime,bodyPreview,isRead,hasAttachments,conversationId,parentFolderId";
+/// excluded (lazy-loaded on open, Phase 4). internetMessageId backs
+/// server-search dedupe (Phase 6).
+pub const MESSAGE_SELECT: &str = "id,subject,from,receivedDateTime,bodyPreview,isRead,\
+     hasAttachments,conversationId,parentFolderId,internetMessageId";
 const DELTA_PAGE_SIZE: u32 = 100;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -168,6 +169,7 @@ struct GraphMessage {
     has_attachments: Option<bool>,
     conversation_id: Option<String>,
     parent_folder_id: Option<String>,
+    internet_message_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +232,15 @@ struct GraphMessageWithBody {
     unique_body: Option<GraphBody>,
 }
 
+/// A server-search result: a message that may or may not exist locally.
+/// The shell drops hits whose Graph id or internetMessageId matches a
+/// local row before they reach the UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServerHit {
+    pub summary: MessageSummary,
+    pub internet_message_id: Option<String>,
+}
+
 /// A lazily-fetched message body. `content` is RAW Graph output — callers
 /// must run HTML through `crate::sanitize::sanitize_html` before storing
 /// or rendering it.
@@ -278,6 +289,7 @@ fn to_domain(g: GraphMessage) -> Message {
         conversation_id: g.conversation_id,
         body_html: None, // never fetched during sync; lazy-loaded on open
         body_content_type: None,
+        internet_message_id: g.internet_message_id,
     }
 }
 
@@ -461,6 +473,43 @@ impl GraphMailSource {
                 .and_then(parse_epoch)
                 .unwrap_or(0),
         })
+    }
+
+    /// Deep server-side search over the whole mailbox. Uses
+    /// `GET /me/messages?$search="KQL"` rather than `POST /search/query`
+    /// because the latter does not support personal Microsoft accounts;
+    /// this path works for both account types on plain `Mail.Read`.
+    /// Results come back in server relevance order ($orderby is not
+    /// allowed with $search).
+    pub async fn search_messages(
+        &self,
+        kql: &str,
+        size: u32,
+    ) -> Result<Vec<ServerHit>, SourceError> {
+        let resp: ListResponse = self
+            .get_json(
+                &format!("{GRAPH_BASE}/me/messages"),
+                &[
+                    // The quotes are part of the $search value.
+                    ("$search", format!("\"{}\"", kql.replace('"', ""))),
+                    ("$select", MESSAGE_SELECT.to_string()),
+                    ("$top", size.clamp(1, 25).to_string()),
+                ],
+                None,
+            )
+            .await?;
+        Ok(resp
+            .value
+            .into_iter()
+            .filter(|m| m.removed.is_none())
+            .map(|g| {
+                let m = to_domain(g);
+                ServerHit {
+                    internet_message_id: m.internet_message_id.clone(),
+                    summary: m.summary,
+                }
+            })
+            .collect())
     }
 
     /// Lazy body fetch for a single message. Returns RAW content — the

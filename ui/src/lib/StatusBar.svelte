@@ -28,6 +28,9 @@
   {#if mail.syncError}
     <span class="err" title={mail.syncError}>offline — reading from local store</span>
   {/if}
+  {#if mail.flash}
+    <span class="flash">{mail.flash}</span>
+  {/if}
 </footer>
 
 <style>
@@ -44,5 +47,10 @@
 
   .err {
     color: var(--sp-text-accent);
+  }
+
+  .flash {
+    margin-left: auto;
+    color: var(--sp-flag);
   }
 </style>

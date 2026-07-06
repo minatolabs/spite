@@ -24,8 +24,18 @@
     if (!id) return
     void (async () => {
       try {
-        const m = await invoke<Message | null>('get_message', { id })
+        let m = await invoke<Message | null>('get_message', { id })
         if (mail.selectedId !== id) return
+        // Server-only hit: not in the local store — synthesize the header
+        // block from the search hit's summary.
+        if (!m && mail.serverSelected?.id === id) {
+          m = {
+            summary: mail.serverSelected,
+            conversation_id: null,
+            body_html: null,
+            body_content_type: null,
+          }
+        }
         message = m
         if (m) {
           allowRemote = await invoke<boolean>('get_sender_pref', {

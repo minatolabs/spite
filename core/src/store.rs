@@ -11,6 +11,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use rusqlite_migration::{Migrations, M};
 use serde::Serialize;
 
+use crate::sanitize::html_to_text;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MailStoreError {
     #[error("database error: {0}")]
@@ -54,6 +56,108 @@ pub struct Message {
     pub body_html: Option<String>,
     /// "html" or "text"; `None` until the body has been fetched.
     pub body_content_type: Option<String>,
+    /// RFC 5322 Message-ID — the dedupe key against server search hits.
+    pub internet_message_id: Option<String>,
+}
+
+/// Message-list filter chips; also usable without a query (filtered browse).
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct SearchFilters {
+    pub folder_id: Option<String>,
+    #[serde(default)]
+    pub unread_only: bool,
+    #[serde(default)]
+    pub has_attachments: bool,
+    pub from: Option<String>,
+    pub date_from: Option<i64>,
+    pub date_to: Option<i64>,
+}
+
+impl SearchFilters {
+    pub fn is_empty(&self) -> bool {
+        self.folder_id.is_none()
+            && !self.unread_only
+            && !self.has_attachments
+            && self.from.is_none()
+            && self.date_from.is_none()
+            && self.date_to.is_none()
+    }
+}
+
+/// One search result. `title`/`snippet` carry match highlighting delimited
+/// by the private-use markers below — the UI splits on them and builds
+/// `<mark>` DOM nodes, so message text can never inject markup.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchHit {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub title: String,
+    pub snippet: String,
+    pub ts: i64,
+    /// Populated for mail hits; `None` for future entity types.
+    pub summary: Option<MessageSummary>,
+}
+
+pub const HIGHLIGHT_START: char = '\u{E000}';
+pub const HIGHLIGHT_END: char = '\u{E001}';
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedSearch {
+    pub id: i64,
+    pub name: String,
+    pub query: String,
+    /// JSON-serialized `SearchFilters`.
+    pub filters: String,
+}
+
+/// Turn raw user input into a safe FTS5 MATCH expression: every token is
+/// double-quoted (colons, NEAR, AND/OR/NOT and stray quotes become inert)
+/// and the final token matches as a prefix for search-as-you-type.
+pub fn fts_query(input: &str) -> Option<String> {
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let last = tokens.len().checked_sub(1)?;
+    Some(
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let escaped = t.replace('"', "\"\"");
+                if i == last {
+                    format!("\"{escaped}\"*")
+                } else {
+                    format!("\"{escaped}\"")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// KQL for Graph `$search` from the same query + filters (server fallback).
+pub fn build_kql(query: &str, filters: &SearchFilters) -> String {
+    let mut parts = Vec::new();
+    let q = query.trim();
+    if !q.is_empty() {
+        parts.push(q.replace('"', "").to_string());
+    }
+    if let Some(from) = filters.from.as_deref().filter(|f| !f.trim().is_empty()) {
+        parts.push(format!("from:{}", from.trim()));
+    }
+    if filters.has_attachments {
+        parts.push("hasAttachment:true".to_string());
+    }
+    let fmt_day = |epoch: i64| {
+        chrono::DateTime::from_timestamp(epoch, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default()
+    };
+    if let Some(d) = filters.date_from {
+        parts.push(format!("received>={}", fmt_day(d)));
+    }
+    if let Some(d) = filters.date_to {
+        parts.push(format!("received<={}", fmt_day(d)));
+    }
+    parts.join(" ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -119,6 +223,40 @@ pub trait MailStore: Send + Sync {
     fn get_signature(&self, account: &str, kind: &str) -> Result<Option<String>, MailStoreError>;
     fn set_signature(&self, account: &str, kind: &str, content: &str)
         -> Result<(), MailStoreError>;
+    /// Ranked, highlighted full-text search. An empty/whitespace query with
+    /// filters set is a filtered browse (newest first).
+    fn search(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, MailStoreError>;
+    /// Index a non-mail document (mail rows are trigger-maintained). This is
+    /// the seam calendar/contact search plugs into later.
+    fn index_document(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        title: &str,
+        subtitle: &str,
+        body: &str,
+        ts: i64,
+    ) -> Result<(), MailStoreError>;
+    fn list_saved_searches(&self) -> Result<Vec<SavedSearch>, MailStoreError>;
+    fn save_search(
+        &self,
+        name: &str,
+        query: &str,
+        filters_json: &str,
+    ) -> Result<i64, MailStoreError>;
+    fn delete_saved_search(&self, id: i64) -> Result<(), MailStoreError>;
+    /// Dedupe helper for server search hits: does this message already exist
+    /// locally, by Graph id or by RFC 5322 internetMessageId?
+    fn message_exists(
+        &self,
+        id: &str,
+        internet_message_id: Option<&str>,
+    ) -> Result<bool, MailStoreError>;
 }
 
 fn migrations() -> Migrations<'static> {
@@ -187,6 +325,68 @@ fn migration_steps() -> Vec<M<'static>> {
               WHERE address LIKE '/%'
                  OR address NOT LIKE '%_@_%.%';",
         ),
+        // v5 (Phase 6): entity-agnostic FTS5 search index, trigger-maintained
+        // for mail (other entity types insert directly via index_document).
+        // Bodies are indexed as plain text via the strip_html() SQL function
+        // registered in SqliteMailStore::init BEFORE migrations run — which
+        // also means tools without that function can't write to `messages`.
+        // The delete-by-entity_id in triggers scans the FTS table (entity_id
+        // is UNINDEXED): O(n) per message update, fine at v0.1 window sizes;
+        // add a rowid map if mailboxes grow.
+        //
+        // internet_message_id backs server-search dedupe; resetting the
+        // delta cursors makes the next sync re-walk each folder window with
+        // the widened $select to backfill it (idempotent upserts).
+        M::up(
+            "ALTER TABLE messages ADD COLUMN internet_message_id TEXT;
+        CREATE VIRTUAL TABLE search_index USING fts5(
+            entity_type UNINDEXED,
+            entity_id   UNINDEXED,
+            title,
+            subtitle,
+            body,
+            ts          UNINDEXED,
+            tokenize = 'unicode61 remove_diacritics 2',
+            prefix = '2 3'
+        );
+        CREATE TRIGGER messages_search_ai AFTER INSERT ON messages BEGIN
+            INSERT INTO search_index (entity_type, entity_id, title, subtitle, body, ts)
+            VALUES ('mail', new.id, new.subject,
+                    new.from_name || ' ' || new.from_address,
+                    CASE WHEN new.body_html IS NULL THEN new.preview
+                         WHEN new.body_content_type = 'text' THEN new.body_html
+                         ELSE strip_html(new.body_html) END,
+                    new.received_at);
+        END;
+        CREATE TRIGGER messages_search_au AFTER UPDATE ON messages BEGIN
+            DELETE FROM search_index WHERE entity_type = 'mail' AND entity_id = old.id;
+            INSERT INTO search_index (entity_type, entity_id, title, subtitle, body, ts)
+            VALUES ('mail', new.id, new.subject,
+                    new.from_name || ' ' || new.from_address,
+                    CASE WHEN new.body_html IS NULL THEN new.preview
+                         WHEN new.body_content_type = 'text' THEN new.body_html
+                         ELSE strip_html(new.body_html) END,
+                    new.received_at);
+        END;
+        CREATE TRIGGER messages_search_ad AFTER DELETE ON messages BEGIN
+            DELETE FROM search_index WHERE entity_type = 'mail' AND entity_id = old.id;
+        END;
+        INSERT INTO search_index (entity_type, entity_id, title, subtitle, body, ts)
+        SELECT 'mail', id, subject, from_name || ' ' || from_address,
+               CASE WHEN body_html IS NULL THEN preview
+                    WHEN body_content_type = 'text' THEN body_html
+                    ELSE strip_html(body_html) END,
+               received_at
+          FROM messages;
+        CREATE TABLE saved_searches (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL,
+            query      TEXT NOT NULL DEFAULT '',
+            filters    TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+        UPDATE sync_state SET delta_link = NULL;",
+        ),
     ]
 }
 
@@ -241,6 +441,18 @@ impl SqliteMailStore {
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // The search_index triggers (and the v5 backfill) call this, so it
+        // must exist before migrations run.
+        conn.create_scalar_function(
+            "strip_html",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let html: String = ctx.get(0)?;
+                Ok(crate::sanitize::html_to_text(&html))
+            },
+        )?;
         migrations().to_latest(conn)?;
         Ok(())
     }
@@ -311,8 +523,9 @@ impl MailStore for SqliteMailStore {
             let mut stmt = tx.prepare(
                 "INSERT INTO messages (id, folder_id, conversation_id, subject, from_name,
                                        from_address, received_at, preview, is_read,
-                                       has_attachments, body_html, body_content_type)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                       has_attachments, body_html, body_content_type,
+                                       internet_message_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET
                      folder_id       = excluded.folder_id,
                      conversation_id = excluded.conversation_id,
@@ -325,7 +538,9 @@ impl MailStore for SqliteMailStore {
                      has_attachments = excluded.has_attachments,
                      body_html       = COALESCE(excluded.body_html, messages.body_html),
                      body_content_type =
-                         COALESCE(excluded.body_content_type, messages.body_content_type)",
+                         COALESCE(excluded.body_content_type, messages.body_content_type),
+                     internet_message_id =
+                         COALESCE(excluded.internet_message_id, messages.internet_message_id)",
             )?;
             for m in messages {
                 let s = &m.summary;
@@ -342,6 +557,7 @@ impl MailStore for SqliteMailStore {
                     s.has_attachments,
                     m.body_html,
                     m.body_content_type,
+                    m.internet_message_id,
                 ])?;
             }
         }
@@ -376,7 +592,7 @@ impl MailStore for SqliteMailStore {
             .query_row(
                 "SELECT id, folder_id, subject, from_name, from_address, received_at,
                         preview, is_read, has_attachments, conversation_id, body_html,
-                        body_content_type
+                        body_content_type, internet_message_id
                  FROM messages WHERE id = ?1",
                 params![id],
                 |row| {
@@ -385,6 +601,7 @@ impl MailStore for SqliteMailStore {
                         conversation_id: row.get("conversation_id")?,
                         body_html: row.get("body_html")?,
                         body_content_type: row.get("body_content_type")?,
+                        internet_message_id: row.get("internet_message_id")?,
                     })
                 },
             )
@@ -571,7 +788,228 @@ impl MailStore for SqliteMailStore {
         )?;
         Ok(())
     }
+
+    fn search(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, MailStoreError> {
+        use rusqlite::types::Value;
+
+        let conn = self.conn.lock().unwrap();
+        let now = crate::sync::now_epoch();
+
+        // Mail-specific filter predicates (applied to the joined messages
+        // row for search, or directly for filtered browse).
+        let mut preds = String::new();
+        let mut pred_params: Vec<Value> = Vec::new();
+        if let Some(folder) = &filters.folder_id {
+            preds.push_str(" AND m.folder_id = ?");
+            pred_params.push(Value::Text(folder.clone()));
+        }
+        if filters.unread_only {
+            preds.push_str(" AND m.is_read = 0");
+        }
+        if filters.has_attachments {
+            preds.push_str(" AND m.has_attachments = 1");
+        }
+        if let Some(from) = filters.from.as_deref().filter(|f| !f.trim().is_empty()) {
+            preds.push_str(" AND (m.from_address LIKE ? OR m.from_name LIKE ?)");
+            let pat = format!("%{}%", from.trim());
+            pred_params.push(Value::Text(pat.clone()));
+            pred_params.push(Value::Text(pat));
+        }
+        if let Some(d) = filters.date_from {
+            preds.push_str(" AND m.received_at >= ?");
+            pred_params.push(Value::Integer(d));
+        }
+        if let Some(d) = filters.date_to {
+            preds.push_str(" AND m.received_at <= ?");
+            pred_params.push(Value::Integer(d));
+        }
+
+        let Some(match_expr) = fts_query(query) else {
+            // Filtered browse: no FTS, plain newest-first message query.
+            let sql = format!(
+                "SELECT id, folder_id, subject, from_name, from_address, received_at,
+                        preview, is_read, has_attachments
+                   FROM messages m
+                  WHERE 1=1{preds}
+                  ORDER BY received_at DESC
+                  LIMIT ?"
+            );
+            pred_params.push(Value::Integer(i64::from(limit)));
+            let mut stmt = conn.prepare(&sql)?;
+            let hits = stmt
+                .query_map(rusqlite::params_from_iter(pred_params), |row| {
+                    let summary = Self::summary_from_row(row)?;
+                    Ok(SearchHit {
+                        entity_type: "mail".to_string(),
+                        entity_id: summary.id.clone(),
+                        title: summary.subject.clone(),
+                        snippet: summary.preview.clone(),
+                        ts: summary.received_at,
+                        summary: Some(summary),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            return Ok(hits);
+        };
+
+        // Mail filters only constrain mail hits; when any is set, non-mail
+        // entities are excluded (the filters are mail concepts).
+        let entity_guard = if filters.is_empty() {
+            ""
+        } else {
+            " AND s.entity_type = 'mail'"
+        };
+        // bm25: 6 weights for 6 columns (unindexed ones weighted 0);
+        // title > subtitle > body, blended with a mild recency penalty
+        // (~0.01 per day, capped at a year) — bm25 is lower-is-better.
+        let sql = format!(
+            "SELECT s.entity_type, s.entity_id,
+                    highlight(search_index, 2, ?2, ?3) AS title_hl,
+                    snippet(search_index, 4, ?2, ?3, '…', 12) AS snip,
+                    CAST(s.ts AS INTEGER) AS ts_i,
+                    m.id, m.folder_id, m.subject, m.from_name, m.from_address,
+                    m.received_at, m.preview, m.is_read, m.has_attachments,
+                    bm25(search_index, 0.0, 0.0, 4.0, 2.0, 1.0, 0.0)
+                      + MIN(MAX(?4 - CAST(s.ts AS INTEGER), 0) / 86400.0, 365.0) * 0.01
+                      AS score
+               FROM search_index s
+               LEFT JOIN messages m
+                 ON s.entity_type = 'mail' AND m.id = s.entity_id
+              WHERE search_index MATCH ?1{entity_guard}{preds}
+              ORDER BY score
+              LIMIT ?"
+        );
+        let mut all_params: Vec<Value> = vec![
+            Value::Text(match_expr),
+            Value::Text(HIGHLIGHT_START.to_string()),
+            Value::Text(HIGHLIGHT_END.to_string()),
+            Value::Integer(now),
+        ];
+        all_params.extend(pred_params);
+        all_params.push(Value::Integer(i64::from(limit)));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let hits = stmt
+            .query_map(rusqlite::params_from_iter(all_params), |row| {
+                let entity_type: String = row.get(0)?;
+                let summary = if entity_type == "mail" {
+                    let id: Option<String> = row.get(5)?;
+                    id.map(|id| {
+                        Ok::<_, rusqlite::Error>(MessageSummary {
+                            id,
+                            folder_id: row.get(6)?,
+                            subject: row.get(7)?,
+                            from_name: row.get(8)?,
+                            from_address: row.get(9)?,
+                            received_at: row.get(10)?,
+                            preview: row.get(11)?,
+                            is_read: row.get(12)?,
+                            has_attachments: row.get(13)?,
+                        })
+                    })
+                    .transpose()?
+                } else {
+                    None
+                };
+                Ok(SearchHit {
+                    entity_type,
+                    entity_id: row.get(1)?,
+                    title: row.get(2)?,
+                    snippet: row.get(3)?,
+                    ts: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    summary,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(hits)
+    }
+
+    fn index_document(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        title: &str,
+        subtitle: &str,
+        body: &str,
+        ts: i64,
+    ) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM search_index WHERE entity_type = ?1 AND entity_id = ?2",
+            params![entity_type, entity_id],
+        )?;
+        conn.execute(
+            "INSERT INTO search_index (entity_type, entity_id, title, subtitle, body, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![entity_type, entity_id, title, subtitle, body, ts],
+        )?;
+        Ok(())
+    }
+
+    fn list_saved_searches(&self) -> Result<Vec<SavedSearch>, MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, name, query, filters FROM saved_searches ORDER BY name")?;
+        let saved = stmt
+            .query_map([], |row| {
+                Ok(SavedSearch {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    query: row.get(2)?,
+                    filters: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(saved)
+    }
+
+    fn save_search(
+        &self,
+        name: &str,
+        query: &str,
+        filters_json: &str,
+    ) -> Result<i64, MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO saved_searches (name, query, filters, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![name, query, filters_json, crate::sync::now_epoch()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn delete_saved_search(&self, id: i64) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM saved_searches WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    fn message_exists(
+        &self,
+        id: &str,
+        internet_message_id: Option<&str>,
+    ) -> Result<bool, MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM messages
+                  WHERE id = ?1
+                     OR (?2 IS NOT NULL AND internet_message_id = ?2))",
+            params![id, internet_message_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
 }
+
+/// A non-mail search document in the memory backend:
+/// (entity_type, entity_id, title, subtitle, body, ts).
+type MemoryDoc = (String, String, String, String, String, i64);
 
 /// In-memory store for tests. Mirrors `SqliteMailStore` semantics, including
 /// body preservation on summary-only upserts.
@@ -585,6 +1023,10 @@ pub struct MemoryMailStore {
     contacts: Mutex<HashMap<String, (String, u32, i64)>>,
     /// (account, kind) → content
     signatures: Mutex<HashMap<(String, String), String>>,
+    /// Non-mail documents added via index_document.
+    documents: Mutex<Vec<MemoryDoc>>,
+    saved_searches: Mutex<Vec<SavedSearch>>,
+    saved_seq: std::sync::atomic::AtomicI64,
 }
 
 impl MailStore for MemoryMailStore {
@@ -790,6 +1232,136 @@ impl MailStore for MemoryMailStore {
             .insert((account.to_string(), kind.to_string()), content.to_string());
         Ok(())
     }
+
+    fn search(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, MailStoreError> {
+        let tokens: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let matches = |haystack: &str| {
+            let h = haystack.to_lowercase();
+            tokens.iter().all(|t| h.contains(t))
+        };
+        let passes = |s: &MessageSummary| {
+            filters.folder_id.as_ref().is_none_or(|f| &s.folder_id == f)
+                && (!filters.unread_only || !s.is_read)
+                && (!filters.has_attachments || s.has_attachments)
+                && filters.from.as_deref().is_none_or(|f| {
+                    let f = f.to_lowercase();
+                    s.from_address.to_lowercase().contains(&f)
+                        || s.from_name.to_lowercase().contains(&f)
+                })
+                && filters.date_from.is_none_or(|d| s.received_at >= d)
+                && filters.date_to.is_none_or(|d| s.received_at <= d)
+        };
+
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for m in self.messages.lock().unwrap().values() {
+            let s = &m.summary;
+            let text = format!(
+                "{} {} {} {} {}",
+                s.subject,
+                s.from_name,
+                s.from_address,
+                s.preview,
+                m.body_html.as_deref().map(html_to_text).unwrap_or_default()
+            );
+            if passes(s) && (tokens.is_empty() || matches(&text)) {
+                hits.push(SearchHit {
+                    entity_type: "mail".to_string(),
+                    entity_id: s.id.clone(),
+                    title: s.subject.clone(),
+                    snippet: s.preview.clone(),
+                    ts: s.received_at,
+                    summary: Some(s.clone()),
+                });
+            }
+        }
+        if filters.is_empty() && !tokens.is_empty() {
+            for (etype, eid, title, subtitle, body, ts) in self.documents.lock().unwrap().iter() {
+                if matches(&format!("{title} {subtitle} {body}")) {
+                    hits.push(SearchHit {
+                        entity_type: etype.clone(),
+                        entity_id: eid.clone(),
+                        title: title.clone(),
+                        snippet: body.clone(),
+                        ts: *ts,
+                        summary: None,
+                    });
+                }
+            }
+        }
+        hits.sort_by_key(|h| std::cmp::Reverse(h.ts));
+        hits.truncate(limit as usize);
+        Ok(hits)
+    }
+
+    fn index_document(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        title: &str,
+        subtitle: &str,
+        body: &str,
+        ts: i64,
+    ) -> Result<(), MailStoreError> {
+        let mut docs = self.documents.lock().unwrap();
+        docs.retain(|(t, i, ..)| !(t == entity_type && i == entity_id));
+        docs.push((
+            entity_type.to_string(),
+            entity_id.to_string(),
+            title.to_string(),
+            subtitle.to_string(),
+            body.to_string(),
+            ts,
+        ));
+        Ok(())
+    }
+
+    fn list_saved_searches(&self) -> Result<Vec<SavedSearch>, MailStoreError> {
+        let mut saved = self.saved_searches.lock().unwrap().clone();
+        saved.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(saved)
+    }
+
+    fn save_search(
+        &self,
+        name: &str,
+        query: &str,
+        filters_json: &str,
+    ) -> Result<i64, MailStoreError> {
+        let id = self
+            .saved_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.saved_searches.lock().unwrap().push(SavedSearch {
+            id,
+            name: name.to_string(),
+            query: query.to_string(),
+            filters: filters_json.to_string(),
+        });
+        Ok(id)
+    }
+
+    fn delete_saved_search(&self, id: i64) -> Result<(), MailStoreError> {
+        self.saved_searches.lock().unwrap().retain(|s| s.id != id);
+        Ok(())
+    }
+
+    fn message_exists(
+        &self,
+        id: &str,
+        internet_message_id: Option<&str>,
+    ) -> Result<bool, MailStoreError> {
+        let map = self.messages.lock().unwrap();
+        Ok(map.contains_key(id)
+            || internet_message_id.is_some_and(|imid| {
+                map.values()
+                    .any(|m| m.internet_message_id.as_deref() == Some(imid))
+            }))
+    }
 }
 
 #[cfg(test)]
@@ -821,6 +1393,7 @@ mod tests {
             conversation_id: None,
             body_html: body.map(str::to_string),
             body_content_type: body.map(|_| "html".to_string()),
+            internet_message_id: Some(format!("{id}@mail.example")),
         }
     }
 
@@ -965,6 +1538,38 @@ mod tests {
         );
         assert!(store.get_signature("other@x.com", "new").unwrap().is_none());
 
+        // Saved searches: save, list (sorted), delete — round-trips on both
+        // backends.
+        let id_a = store
+            .save_search("Unread from Alice", "alice", r#"{"unread_only":true}"#)
+            .unwrap();
+        store
+            .save_search("Attachments", "", r#"{"has_attachments":true}"#)
+            .unwrap();
+        let saved = store.list_saved_searches().unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].name, "Attachments");
+        assert_eq!(saved[1].query, "alice");
+        store.delete_saved_search(id_a).unwrap();
+        assert_eq!(store.list_saved_searches().unwrap().len(), 1);
+
+        // Server-hit dedupe: known by Graph id, known by internetMessageId,
+        // unknown otherwise.
+        assert!(store.message_exists("m1", None).unwrap());
+        assert!(store
+            .message_exists("some-other-graph-id", Some("m1@mail.example"))
+            .unwrap());
+        assert!(!store
+            .message_exists("nope", Some("nope@mail.example"))
+            .unwrap());
+
+        // Basic search smoke on the shared contract (backend-specific FTS
+        // behavior is covered in the sqlite-only tests).
+        let hits = store
+            .search("subject m4", &SearchFilters::default(), 10)
+            .unwrap();
+        assert!(hits.iter().any(|h| h.entity_id == "m4"));
+
         // Deletion: removes the row; deleting again (or a missing id) is a no-op.
         store
             .upsert_messages(&[message("gone", "f1", 50, None)])
@@ -1019,7 +1624,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
@@ -1034,15 +1639,17 @@ mod tests {
             "sender_prefs",
             "contacts",
             "signatures",
+            "saved_searches",
+            "search_index",
         ] {
             assert!(tables.iter().any(|t| t == required), "missing {required}");
         }
     }
 
-    #[test]
-    fn migrations_are_valid() {
-        assert!(migrations().validate().is_ok());
-    }
+    // NOTE: rusqlite_migration's validate() can't run here — the v5 backfill
+    // calls the strip_html() SQL function, which only exists on connections
+    // opened through SqliteMailStore::init. The open()-based tests below
+    // exercise the full migration chain instead.
 
     #[test]
     fn smtp_address_validation() {
@@ -1066,6 +1673,201 @@ mod tests {
         ] {
             assert!(!is_smtp_address(bad), "{bad} should be rejected");
         }
+    }
+
+    fn seeded_store() -> SqliteMailStore {
+        let store = SqliteMailStore::open_in_memory().unwrap();
+        store
+            .upsert_folders(&[folder("f1", "Inbox"), folder("f2", "Archive")])
+            .unwrap();
+        let mut quarterly = message("m1", "f1", 1_000, Some("<p>revenue tables attached</p>"));
+        quarterly.summary.subject = "Quarterly numbers".into();
+        quarterly.summary.from_name = "Alice Café".into();
+        quarterly.summary.from_address = "alice@example.com".into();
+        let mut lunch = message("m2", "f1", 2_000, None);
+        lunch.summary.subject = "Lunch tomorrow?".into();
+        lunch.summary.from_name = "Bob".into();
+        lunch.summary.from_address = "bob@example.com".into();
+        lunch.summary.preview = "new cafeteria menu".into();
+        lunch.summary.has_attachments = true;
+        let mut old = message("m3", "f2", 500, None);
+        old.summary.subject = "Archived quarterly plan".into();
+        old.summary.is_read = true;
+        store.upsert_messages(&[quarterly, lunch, old]).unwrap();
+        store
+    }
+
+    #[test]
+    fn fts_query_builder_neutralizes_operators() {
+        assert_eq!(fts_query("hello world"), Some(r#""hello" "world"*"#.into()));
+        assert_eq!(fts_query("  "), None);
+        assert_eq!(fts_query("a:b"), Some(r#""a:b"*"#.into()));
+        assert_eq!(fts_query(r#"say "hi""#), Some(r#""say" """hi"""*"#.into()));
+        // Operator words are quoted into plain tokens.
+        assert_eq!(fts_query("AND"), Some(r#""AND"*"#.into()));
+    }
+
+    #[test]
+    fn fts_search_ranks_highlights_and_prefixes() {
+        let store = seeded_store();
+        // Prefix match while typing.
+        let hits = store.search("quar", &SearchFilters::default(), 10).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|h| h.entity_type == "mail"));
+        // Title highlighting uses the private-use markers.
+        assert!(
+            hits[0].title.contains(HIGHLIGHT_START) && hits[0].title.contains(HIGHLIGHT_END),
+            "{:?}",
+            hits[0].title
+        );
+        // Diacritic-insensitive: 'cafe' finds both 'Café' (subtitle) and
+        // 'cafeteria' (prefix in body/preview).
+        let hits = store.search("cafe", &SearchFilters::default(), 10).unwrap();
+        assert!(!hits.is_empty());
+        // Body text (stripped from HTML) is searchable; no tag tokens.
+        let hits = store
+            .search("revenue", &SearchFilters::default(), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, "m1");
+        assert!(store
+            .search("div", &SearchFilters::default(), 10)
+            .unwrap()
+            .is_empty());
+        // Malicious-looking query input cannot break the MATCH expression.
+        for weird in [r#"a" OR "b"#, "col:umn", "NEAR(", "(((", "\"\"\""] {
+            store.search(weird, &SearchFilters::default(), 10).unwrap();
+        }
+    }
+
+    #[test]
+    fn fts_index_follows_message_lifecycle() {
+        let store = seeded_store();
+        // Body cache upgrade reindexes: 'zeppelin' only exists in the body
+        // set after the initial insert.
+        assert!(store
+            .search("zeppelin", &SearchFilters::default(), 10)
+            .unwrap()
+            .is_empty());
+        store
+            .set_message_body("m2", "<p>the zeppelin schedule</p>", "html")
+            .unwrap();
+        let hits = store
+            .search("zeppelin", &SearchFilters::default(), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, "m2");
+        // Deletion removes the index row — no orphans.
+        store.delete_message("m2").unwrap();
+        assert!(store
+            .search("zeppelin", &SearchFilters::default(), 10)
+            .unwrap()
+            .is_empty());
+        // Summary-only re-upsert (delta replay) keeps the row searchable.
+        store
+            .upsert_messages(&[message("m1", "f1", 1_000, None)])
+            .unwrap();
+        assert!(!store
+            .search("subject", &SearchFilters::default(), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn search_filters_and_browse() {
+        let store = seeded_store();
+        let mut f = SearchFilters {
+            folder_id: Some("f1".into()),
+            ..Default::default()
+        };
+        let hits = store.search("quarterly", &f, 10).unwrap();
+        assert_eq!(hits.len(), 1, "folder scope narrows to the inbox copy");
+        assert_eq!(hits[0].entity_id, "m1");
+
+        f = SearchFilters {
+            has_attachments: true,
+            ..Default::default()
+        };
+        let hits = store.search("", &f, 10).unwrap();
+        assert_eq!(hits.len(), 1, "filtered browse with empty query");
+        assert_eq!(hits[0].entity_id, "m2");
+
+        f = SearchFilters {
+            unread_only: true,
+            from: Some("alice".into()),
+            ..Default::default()
+        };
+        let hits = store.search("", &f, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, "m1");
+
+        f = SearchFilters {
+            date_from: Some(900),
+            date_to: Some(1_500),
+            ..Default::default()
+        };
+        let hits = store.search("", &f, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, "m1");
+    }
+
+    #[test]
+    fn search_index_is_entity_agnostic() {
+        let store = seeded_store();
+        store
+            .index_document(
+                "event",
+                "ev-1",
+                "Design review",
+                "Conference room 4",
+                "walk through the quarterly mockups",
+                3_000,
+            )
+            .unwrap();
+        let hits = store
+            .search("design review", &SearchFilters::default(), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_type, "event");
+        assert_eq!(hits[0].entity_id, "ev-1");
+        assert!(hits[0].summary.is_none());
+        // Events and mail rank together in one query.
+        let hits = store
+            .search("quarterly", &SearchFilters::default(), 10)
+            .unwrap();
+        assert!(hits.iter().any(|h| h.entity_type == "event"));
+        assert!(hits.iter().any(|h| h.entity_type == "mail"));
+        // Mail filters exclude non-mail entities.
+        let f = SearchFilters {
+            folder_id: Some("f1".into()),
+            ..Default::default()
+        };
+        let hits = store.search("quarterly", &f, 10).unwrap();
+        assert!(hits.iter().all(|h| h.entity_type == "mail"));
+        // Re-indexing the same document replaces, not duplicates.
+        store
+            .index_document("event", "ev-1", "Design review v2", "", "updated", 3_100)
+            .unwrap();
+        let hits = store
+            .search("design", &SearchFilters::default(), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn kql_builder_composes_query_and_filters() {
+        let f = SearchFilters {
+            from: Some("alice@example.com".into()),
+            has_attachments: true,
+            date_from: Some(1_751_328_000), // 2025-07-01
+            ..Default::default()
+        };
+        let kql = build_kql(r#"quarterly "numbers""#, &f);
+        assert_eq!(
+            kql,
+            "quarterly numbers from:alice@example.com hasAttachment:true received>=2025-07-01"
+        );
+        assert_eq!(build_kql("", &SearchFilters::default()), "");
     }
 
     #[test]
