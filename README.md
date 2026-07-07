@@ -65,7 +65,11 @@ Entra app registration:
   // optional; undo-send window in seconds (Gmail-style). The message
   // actually sends only after this countdown; Undo cancels and reopens
   // the draft. Defaults to 15, clamped to 0..=120 (0 sends immediately).
-  "undo_send_seconds": 15
+  "undo_send_seconds": 15,
+  // optional; dwell in ms before an opened unread message auto-marks read,
+  // so scrubbing past messages with j/k doesn't mark them. Defaults to 500,
+  // clamped to 0..=10000 (0 disables auto-mark-read).
+  "auto_read_dwell_ms": 500
 }
 ```
 

@@ -339,6 +339,15 @@ export function toggleRead(m: MessageSummary) {
   ).then(() => refreshCounts())
 }
 
+/** Mark an unread message read via the optimistic path (no-op if already
+ *  read). Used by auto-mark-read-on-dwell; manual toggle stays separate. */
+export function markRead(m: MessageSummary) {
+  if (m.is_read) return
+  void immediateOp({ kind: 'setRead', id: m.id, isRead: true }, () =>
+    patchLocalSummary(m.id, { is_read: true }),
+  ).then(() => refreshCounts())
+}
+
 export function toggleFlag(m: MessageSummary) {
   const next = m.flag_status === 'flagged' ? 'notFlagged' : 'flagged'
   void immediateOp({ kind: 'setFlag', id: m.id, flagged: next === 'flagged' }, () =>

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import {
     Archive,
@@ -18,6 +19,7 @@
   import {
     archive,
     mail,
+    markRead,
     moveToFolder,
     setCategories,
     setFocused,
@@ -30,6 +32,15 @@
   import FolderPicker from './FolderPicker.svelte'
 
   let showMovePicker = $state(false)
+
+  // Auto-mark-read after a short dwell so arrow-key / j-k scrubbing past a
+  // message doesn't mark it. Configurable; 0 disables.
+  let autoReadMs = $state(500)
+  onMount(() => {
+    invoke<number>('get_auto_read_dwell')
+      .then((ms) => (autoReadMs = ms))
+      .catch(() => {})
+  })
 
   let addingCategory = $state(false)
   let newCategory = $state('')
@@ -91,6 +102,26 @@
   let hasRemoteImages = $derived.by(() => {
     const b: MessageBody | null = body
     return !!b && b.content_type === 'html' && /<img[^>]+src=["']https?:/i.test(b.body)
+  })
+
+  // Auto-mark-read after the configured dwell. $effect re-runs (and runs its
+  // cleanup) on every selection change, so scrubbing past a message with
+  // arrow keys / j-k cancels the pending mark before it fires.
+  $effect(() => {
+    const id = mail.selectedId
+    if (!id || autoReadMs <= 0 || mail.serverSelected) return
+    const summary = mail.messages.find((m) => m.id === id)
+    if (!summary || summary.is_read) return
+    const timer = setTimeout(() => {
+      const cur = mail.messages.find((m) => m.id === id)
+      if (mail.selectedId === id && cur && !cur.is_read) {
+        markRead(cur)
+        if (message && message.summary.id === id) {
+          message = { ...message, summary: { ...message.summary, is_read: true } }
+        }
+      }
+    }, autoReadMs)
+    return () => clearTimeout(timer)
   })
 
   $effect(() => {

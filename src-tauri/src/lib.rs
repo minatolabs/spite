@@ -706,6 +706,12 @@ fn get_keymap(config: State<'_, AppConfig>) -> std::collections::HashMap<String,
     config.keymap.clone()
 }
 
+/// Dwell (ms) before an opened unread message auto-marks read; 0 disables.
+#[tauri::command]
+fn get_auto_read_dwell(config: State<'_, AppConfig>) -> u32 {
+    config.auto_read_dwell_ms
+}
+
 // --- Phase 7 mail management ---
 
 /// Immediate optimistic op (read/flag/categories/inference): apply locally,
@@ -1087,6 +1093,7 @@ pub fn run() {
             save_search,
             delete_saved_search,
             get_keymap,
+            get_auto_read_dwell,
             apply_op,
             queue_op,
             queue_bulk_op,

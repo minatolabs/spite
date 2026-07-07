@@ -17,6 +17,9 @@ pub const CONFIG_FILE: &str = "config.json";
 pub const DEFAULT_BACKFILL_COUNT: u32 = 200;
 /// Undo-send window: seconds a queued message waits before actually sending.
 pub const DEFAULT_UNDO_SEND_SECONDS: u32 = 15;
+/// Dwell before an opened unread message auto-marks read, so j/k scrubbing
+/// past a message doesn't mark it. `0` disables auto-mark-read.
+pub const DEFAULT_AUTO_READ_DWELL_MS: u32 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -31,6 +34,9 @@ pub struct AppConfig {
     /// Keyboard-shortcut overrides (action name → key); unlisted actions
     /// keep the vim-flavored defaults defined in the UI.
     pub keymap: HashMap<String, String>,
+    /// Dwell in ms before an opened unread message auto-marks read
+    /// (clamped to 0..=10000; 0 disables).
+    pub auto_read_dwell_ms: u32,
 }
 
 impl Default for AppConfig {
@@ -42,6 +48,7 @@ impl Default for AppConfig {
             backfill_count: DEFAULT_BACKFILL_COUNT,
             undo_send_seconds: DEFAULT_UNDO_SEND_SECONDS,
             keymap: HashMap::new(),
+            auto_read_dwell_ms: DEFAULT_AUTO_READ_DWELL_MS,
         }
     }
 }
@@ -55,6 +62,7 @@ struct ConfigOverrides {
     backfill_count: Option<u32>,
     undo_send_seconds: Option<u32>,
     keymap: Option<HashMap<String, String>>,
+    auto_read_dwell_ms: Option<u32>,
 }
 
 impl AppConfig {
@@ -82,6 +90,9 @@ impl AppConfig {
                     }
                     if let Some(v) = overrides.keymap {
                         cfg.keymap = v;
+                    }
+                    if let Some(v) = overrides.auto_read_dwell_ms {
+                        cfg.auto_read_dwell_ms = v.min(10_000);
                     }
                 }
                 Err(e) => eprintln!("spite: ignoring malformed {}: {e}", path.display()),
