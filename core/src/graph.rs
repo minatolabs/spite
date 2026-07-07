@@ -51,7 +51,7 @@ pub async fn get_me(http: &reqwest::Client, access_token: &str) -> Result<Me, Gr
 /// Summary fields synced into the local store. Bodies are deliberately
 /// excluded (lazy-loaded on open, Phase 4). internetMessageId backs
 /// server-search dedupe (Phase 6).
-pub const MESSAGE_SELECT: &str = "id,subject,from,receivedDateTime,bodyPreview,isRead,\
+pub const MESSAGE_SELECT: &str = "id,subject,from,sender,receivedDateTime,bodyPreview,isRead,\
      hasAttachments,conversationId,parentFolderId,internetMessageId,flag,\
      inferenceClassification,categories,isDraft";
 const DELTA_PAGE_SIZE: u32 = 100;
@@ -232,6 +232,9 @@ struct GraphMessage {
     removed: Option<serde_json::Value>,
     subject: Option<String>,
     from: Option<GraphRecipient>,
+    /// The actual submitting sender; falls back to this when `from` is null
+    /// (some mailing-list / automated mail populates `sender` but not `from`).
+    sender: Option<GraphRecipient>,
     received_date_time: Option<String>,
     body_preview: Option<String>,
     is_read: Option<bool>,
@@ -343,9 +346,15 @@ fn epoch_to_rfc3339(epoch: i64) -> String {
 }
 
 fn to_domain(g: GraphMessage) -> Message {
-    let (from_name, from_address) = match g.from.and_then(|r| r.email_address) {
+    // Prefer `from`; fall back to `sender` when `from` is null (some
+    // automated / list mail sets only `sender`). Drafts may have neither.
+    let sender = g
+        .from
+        .and_then(|r| r.email_address)
+        .or_else(|| g.sender.and_then(|r| r.email_address));
+    let (from_name, from_address) = match sender {
         Some(e) => (e.name.unwrap_or_default(), e.address.unwrap_or_default()),
-        None => (String::new(), String::new()), // e.g. drafts have no `from`
+        None => (String::new(), String::new()),
     };
     Message {
         summary: MessageSummary {
@@ -789,6 +798,35 @@ impl GraphMailSource {
             .collect())
     }
 
+    /// Re-fetch full summaries for the given ids (batched, ≤20 per call) to
+    /// repair rows a partial delta event blanked. Each message's real
+    /// `parentFolderId` is used, so a repaired row lands in the right folder.
+    pub async fn fetch_summaries(&self, ids: &[String]) -> Result<Vec<Message>, SourceError> {
+        let mut out = Vec::new();
+        for chunk in ids.chunks(20) {
+            let subs: Vec<BatchSub> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, id)| BatchSub {
+                    index: i,
+                    method: "GET",
+                    url: format!("/me/messages/{id}?$select={MESSAGE_SELECT}"),
+                    body: None,
+                })
+                .collect();
+            for r in self.execute_chunk(&subs).await? {
+                if (200..300).contains(&r.status) {
+                    if let Ok(g) = serde_json::from_value::<GraphMessage>(r.body) {
+                        if g.removed.is_none() {
+                            out.push(to_domain(g));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Lazy body fetch for a single message. Returns RAW content — the
     /// caller sanitizes HTML before it goes anywhere.
     pub async fn fetch_message_body(&self, id: &str) -> Result<FetchedBody, SourceError> {
@@ -1023,5 +1061,27 @@ mod tests {
         assert_eq!(m.summary.subject, "");
         assert_eq!(m.summary.received_at, 0);
         assert!(m.body_html.is_none());
+    }
+
+    #[test]
+    fn from_falls_back_to_sender() {
+        // Some automated / list mail sets `sender` but not `from`.
+        let item: GraphMessage = serde_json::from_str(
+            r#"{"id": "x", "subject": "Hi",
+                "sender": {"emailAddress": {"name": "List Bot", "address": "bot@list.example"}}}"#,
+        )
+        .unwrap();
+        let m = to_domain(item);
+        assert_eq!(m.summary.from_name, "List Bot");
+        assert_eq!(m.summary.from_address, "bot@list.example");
+
+        // `from` wins when both are present.
+        let item: GraphMessage = serde_json::from_str(
+            r#"{"id": "y",
+                "from": {"emailAddress": {"address": "real@example.com"}},
+                "sender": {"emailAddress": {"address": "agent@example.com"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(to_domain(item).summary.from_address, "real@example.com");
     }
 }

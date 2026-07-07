@@ -268,6 +268,10 @@ pub trait MailStore: Send + Sync {
         internet_message_id: Option<&str>,
     ) -> Result<bool, MailStoreError>;
 
+    /// Ids of rows whose summary was blanked by a partial delta event
+    /// (empty sender + no received date) — candidates for a re-fetch repair.
+    fn broken_summary_ids(&self, limit: u32) -> Result<Vec<String>, MailStoreError>;
+
     // --- Phase 7 optimistic write mutators. Each is a pure local state
     // change; `ops::execute_op` pairs them with the Graph call + rollback. ---
 
@@ -571,22 +575,43 @@ impl MailStore for SqliteMailStore {
                          ?14, ?15, ?16, ?17)
                  ON CONFLICT(id) DO UPDATE SET
                      folder_id       = excluded.folder_id,
-                     conversation_id = excluded.conversation_id,
-                     subject         = excluded.subject,
-                     from_name       = excluded.from_name,
-                     from_address    = excluded.from_address,
-                     received_at     = excluded.received_at,
-                     preview         = excluded.preview,
+                     -- Incremental delta emits bare change-events (a read/flag
+                     -- flip) as a message carrying only its id + the changed
+                     -- state, with no from/subject/receivedDateTime. Detect
+                     -- that (empty from + received_at 0) and preserve the
+                     -- existing descriptive fields, so such an event never
+                     -- blanks a good summary. The state flags below still apply.
+                     subject = CASE
+                         WHEN excluded.from_address = '' AND excluded.received_at = 0
+                         THEN messages.subject ELSE excluded.subject END,
+                     from_name = CASE
+                         WHEN excluded.from_address = '' AND excluded.received_at = 0
+                         THEN messages.from_name ELSE excluded.from_name END,
+                     from_address = CASE
+                         WHEN excluded.from_address = '' AND excluded.received_at = 0
+                         THEN messages.from_address ELSE excluded.from_address END,
+                     received_at = CASE
+                         WHEN excluded.received_at = 0
+                         THEN messages.received_at ELSE excluded.received_at END,
+                     preview = CASE
+                         WHEN excluded.from_address = '' AND excluded.received_at = 0
+                         THEN messages.preview ELSE excluded.preview END,
+                     has_attachments = CASE
+                         WHEN excluded.from_address = '' AND excluded.received_at = 0
+                         THEN messages.has_attachments ELSE excluded.has_attachments END,
+                     categories = CASE
+                         WHEN excluded.from_address = '' AND excluded.received_at = 0
+                         THEN messages.categories ELSE excluded.categories END,
                      is_read         = excluded.is_read,
-                     has_attachments = excluded.has_attachments,
                      body_html       = COALESCE(excluded.body_html, messages.body_html),
                      body_content_type =
                          COALESCE(excluded.body_content_type, messages.body_content_type),
+                     conversation_id =
+                         COALESCE(excluded.conversation_id, messages.conversation_id),
                      internet_message_id =
                          COALESCE(excluded.internet_message_id, messages.internet_message_id),
                      flag_status              = excluded.flag_status,
                      inference_classification = excluded.inference_classification,
-                     categories               = excluded.categories,
                      is_draft                 = excluded.is_draft",
             )?;
             for m in messages {
@@ -1069,6 +1094,17 @@ impl MailStore for SqliteMailStore {
         Ok(exists)
     }
 
+    fn broken_summary_ids(&self, limit: u32) -> Result<Vec<String>, MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM messages WHERE from_address = '' AND received_at = 0 LIMIT ?1",
+        )?;
+        let ids = stmt
+            .query_map(params![limit], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
     fn set_read_state(&self, id: &str, is_read: bool) -> Result<(), MailStoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1180,6 +1216,26 @@ impl MailStore for MemoryMailStore {
                 }
                 if m.body_content_type.is_none() {
                     m.body_content_type = existing.body_content_type.clone();
+                }
+                if m.internet_message_id.is_none() {
+                    m.internet_message_id = existing.internet_message_id.clone();
+                }
+                if m.conversation_id.is_none() {
+                    m.conversation_id = existing.conversation_id.clone();
+                }
+                // Mirror the SQLite guard: a partial delta change-event (empty
+                // sender + no received date) must not blank a good summary.
+                let partial = m.summary.from_address.is_empty() && m.summary.received_at == 0;
+                if partial {
+                    m.summary.subject = existing.summary.subject.clone();
+                    m.summary.from_name = existing.summary.from_name.clone();
+                    m.summary.from_address = existing.summary.from_address.clone();
+                    m.summary.preview = existing.summary.preview.clone();
+                    m.summary.has_attachments = existing.summary.has_attachments;
+                    m.categories = existing.categories.clone();
+                }
+                if m.summary.received_at == 0 {
+                    m.summary.received_at = existing.summary.received_at;
                 }
             }
             map.insert(m.summary.id.clone(), m);
@@ -1489,6 +1545,18 @@ impl MailStore for MemoryMailStore {
             }))
     }
 
+    fn broken_summary_ids(&self, limit: u32) -> Result<Vec<String>, MailStoreError> {
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|m| m.summary.from_address.is_empty() && m.summary.received_at == 0)
+            .map(|m| m.summary.id.clone())
+            .take(limit as usize)
+            .collect())
+    }
+
     fn set_read_state(&self, id: &str, is_read: bool) -> Result<(), MailStoreError> {
         if let Some(m) = self.messages.lock().unwrap().get_mut(id) {
             m.summary.is_read = is_read;
@@ -1790,6 +1858,101 @@ mod tests {
     #[test]
     fn sqlite_store_contract() {
         exercise(&SqliteMailStore::open_in_memory().unwrap());
+    }
+
+    /// A partial delta change-event (empty sender + received_at 0, as Graph
+    /// sends for a bare read/flag flip) must NOT blank a good summary — only
+    /// the state flags update. Regression for the "(unknown sender)" bug.
+    fn partial_event_preserves_summary(store: &dyn MailStore) {
+        store.upsert_folders(&[folder("f1", "Inbox")]).unwrap();
+        let mut full = message("m1", "f1", 1000, Some("<p>body</p>"));
+        full.summary.subject = "Real subject".into();
+        full.summary.from_name = "Alice".into();
+        full.summary.from_address = "alice@example.com".into();
+        full.summary.preview = "hello there".into();
+        full.summary.has_attachments = true;
+        store.upsert_messages(&[full]).unwrap();
+
+        // A bare change-event: same id, is_read flipped, everything else empty.
+        let partial = Message {
+            summary: MessageSummary {
+                id: "m1".into(),
+                folder_id: "f1".into(),
+                subject: String::new(),
+                from_name: String::new(),
+                from_address: String::new(),
+                received_at: 0,
+                preview: String::new(),
+                is_read: true,
+                has_attachments: false,
+                flag_status: "flagged".into(),
+                inference_classification: "focused".into(),
+                is_draft: false,
+            },
+            conversation_id: None,
+            body_html: None,
+            body_content_type: None,
+            internet_message_id: None,
+            categories: vec![],
+        };
+        store.upsert_messages(&[partial]).unwrap();
+
+        let m = store.get_message("m1").unwrap().unwrap();
+        // Descriptive fields preserved.
+        assert_eq!(m.summary.subject, "Real subject");
+        assert_eq!(m.summary.from_address, "alice@example.com");
+        assert_eq!(m.summary.preview, "hello there");
+        assert_eq!(m.summary.received_at, 1000);
+        assert!(m.summary.has_attachments);
+        assert!(m.body_html.is_some(), "cached body preserved");
+        // State the event actually carried is applied.
+        assert!(m.summary.is_read);
+        assert_eq!(m.summary.flag_status, "flagged");
+
+        // A *full* update (real sender + date) still overwrites normally.
+        let mut updated = message("m1", "f1", 2000, None);
+        updated.summary.subject = "Edited".into();
+        updated.summary.from_address = "bob@example.com".into();
+        store.upsert_messages(&[updated]).unwrap();
+        let m = store.get_message("m1").unwrap().unwrap();
+        assert_eq!(m.summary.subject, "Edited");
+        assert_eq!(m.summary.from_address, "bob@example.com");
+
+        // broken_summary_ids finds a genuinely-blank row and not a good one.
+        let blank = Message {
+            summary: MessageSummary {
+                id: "blank".into(),
+                folder_id: "f1".into(),
+                subject: String::new(),
+                from_name: String::new(),
+                from_address: String::new(),
+                received_at: 0,
+                preview: String::new(),
+                is_read: false,
+                has_attachments: false,
+                flag_status: "notFlagged".into(),
+                inference_classification: "focused".into(),
+                is_draft: false,
+            },
+            conversation_id: None,
+            body_html: None,
+            body_content_type: None,
+            internet_message_id: None,
+            categories: vec![],
+        };
+        store.upsert_messages(&[blank]).unwrap();
+        let broken = store.broken_summary_ids(10).unwrap();
+        assert_eq!(broken, ["blank"]);
+    }
+
+    #[test]
+    fn partial_event_guard_memory() {
+        partial_event_preserves_summary(&MemoryMailStore::default());
+    }
+
+    #[test]
+    fn partial_event_guard_sqlite() {
+        partial_event_preserves_summary(&SqliteMailStore::open_in_memory().unwrap());
     }
 
     #[test]

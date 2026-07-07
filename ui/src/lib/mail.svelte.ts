@@ -293,6 +293,10 @@ export async function initMail() {
       const i = mail.folders.find((f) => f.well_known_name === 'inbox')
       if (i) await selectFolder(i.id)
     }
+    // One-shot repair of rows an earlier partial delta event blanked
+    // (empty sender/subject); re-fetches their summaries from Graph.
+    const repaired = await invoke<number>('repair_summaries')
+    if (repaired > 0) await paintMessages()
   } catch {
     // Offline: the locally cached folder list is all we need.
   }

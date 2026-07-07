@@ -712,6 +712,32 @@ fn get_auto_read_dwell(config: State<'_, AppConfig>) -> u32 {
     config.auto_read_dwell_ms
 }
 
+/// Repair rows whose summary a partial delta event blanked: re-fetch full
+/// summaries from Graph and upsert (the upsert guard lets the full data win).
+/// Returns the number of rows repaired.
+#[tauri::command]
+async fn repair_summaries(
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<usize, String> {
+    let ids = store_call(&store, |s| s.broken_summary_ids(500)).await?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let msgs = GraphMailSource::new(Arc::clone(&auth))
+        .fetch_summaries(&ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    let n = msgs.len();
+    store_call(&store, move |s| s.upsert_messages(&msgs)).await?;
+    tracing::info!(
+        repaired = n,
+        candidates = ids.len(),
+        "repaired blanked summaries"
+    );
+    Ok(n)
+}
+
 // --- Phase 7 mail management ---
 
 /// Immediate optimistic op (read/flag/categories/inference): apply locally,
@@ -1094,6 +1120,7 @@ pub fn run() {
             delete_saved_search,
             get_keymap,
             get_auto_read_dwell,
+            repair_summaries,
             apply_op,
             queue_op,
             queue_bulk_op,
