@@ -172,17 +172,19 @@ startup — you only need to export it yourself if you launch the webview
 through some other harness, and you can override the behavior by setting
 the variable to `0` before launching.
 
-## Roadmap (v0.1)
+## Roadmap (v0.2)
 
 - [x] Phase 0 — Tauri 2 scaffold
 - [x] Phase 1 — device-code auth, tokens in OS keychain
 - [x] Phase 2 — local SQLite store + migrations
 - [x] Phase 3 — Graph delta sync
 - [x] Phase 4 — read UI (offline-capable list + message view)
-- [ ] Phase 5 — compose + send
+- [x] Phase 5 — compose + send
 - [x] Phase 6 — local full-text search (FTS5)
-- [ ] Phase 7 — mail management (read/flag/move/archive/delete, drafts, bulk)
-- [ ] Phase 8A — mailbox settings (out-of-office, categories, working hours)
+- [x] Phase 7 — mail management (read/flag/move/archive/delete, drafts, bulk)
+- [x] Phase 8A — mailbox settings (out-of-office, categories, working hours)
+- [ ] Phase 8B — mailbox rules (messageRules engine)
+- [ ] Phase 9 — calendar
 
 ## License
 
