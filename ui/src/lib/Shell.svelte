@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { getCurrentWindow } from '@tauri-apps/api/window'
-  import { LogOut, PenLine, RefreshCw, Settings2 } from 'lucide-svelte'
+  import { LogOut, Mailbox, PenLine, RefreshCw, Settings2 } from 'lucide-svelte'
   import BulkBar from './BulkBar.svelte'
   import FilterChips from './FilterChips.svelte'
   import FolderTree from './FolderTree.svelte'
@@ -11,6 +11,7 @@
   import ReadingPane from './ReadingPane.svelte'
   import SearchBar from './SearchBar.svelte'
   import SendToasts from './SendToasts.svelte'
+  import SettingsPane from './SettingsPane.svelte'
   import SignatureSettings from './SignatureSettings.svelte'
   import StatusBar from './StatusBar.svelte'
   import {
@@ -31,6 +32,7 @@
   let { account, onsignout }: { account: Account; onsignout: () => void } = $props()
 
   let showSignatures = $state(false)
+  let showSettings = $state(false)
 
   function composeNew() {
     void invoke('open_compose', { mode: 'new', messageId: null })
@@ -180,6 +182,9 @@
       <RefreshCw size={13} />
       {mail.syncing ? 'Syncing…' : 'Sync'}
     </button>
+    <button class="sp-btn" onclick={() => (showSettings = true)} title="Mailbox settings">
+      <Mailbox size={13} />
+    </button>
     <button class="sp-btn" onclick={() => (showSignatures = true)} title="Signatures">
       <Settings2 size={13} />
     </button>
@@ -191,6 +196,10 @@
 
   {#if showSignatures}
     <SignatureSettings onclose={() => (showSignatures = false)} />
+  {/if}
+
+  {#if showSettings}
+    <SettingsPane onclose={() => (showSettings = false)} />
   {/if}
 
   <SendToasts />

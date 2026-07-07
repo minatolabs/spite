@@ -41,12 +41,15 @@ Entra app registration:
    directory).
 2. Authentication → **Allow public client flows = Yes**. No client secret.
 3. API permissions → Microsoft Graph → Delegated: `Mail.Read`,
-   `Mail.ReadWrite`, `Mail.Send`, `User.Read`. (`offline_access` is consented
-   implicitly.) `Mail.ReadWrite` is what lets Spite be a real mail client —
-   mark read, flag, move, archive, delete, and true drafts are all writes; a
-   read-only viewer can't do them. If you're upgrading an existing install,
-   add `Mail.ReadWrite` and Spite will prompt for one clean re-consent on the
-   next launch (your account stays connected — it's re-consent, not re-setup).
+   `Mail.ReadWrite`, `Mail.Send`, `MailboxSettings.ReadWrite`, `User.Read`.
+   (`offline_access` is consented implicitly.) `Mail.ReadWrite` is what lets
+   Spite be a real mail client — mark read, flag, move, archive, delete, and
+   true drafts are all writes; a read-only viewer can't do them.
+   `MailboxSettings.ReadWrite` adds out-of-office and managed categories. Both
+   are the exact scopes needed — nothing broader (no `.All`, no `.Shared`). If
+   you're upgrading an existing install, add the missing scope(s) and Spite
+   will prompt for one clean re-consent on the next launch (your account stays
+   connected — it's re-consent, not re-setup).
 4. Copy the **Application (client) ID** into Spite's config file:
 
 ```jsonc
@@ -117,6 +120,29 @@ Manager), never on disk.
 - Keyboard `e` (archive), `#` (delete), `s` (flag) now perform real actions.
 - Scope: this adds exactly `Mail.ReadWrite` — nothing broader.
 
+## Mailbox settings
+
+- **Automatic replies (out-of-office)**: on/off, an optional scheduled window
+  (interpreted in your mailbox's own timezone), separate internal and external
+  reply bodies with a minimal rich editor, and the external-audience toggle
+  (nobody / contacts only / everyone). Bodies are **sanitized in Rust** through
+  the same `ammonia` path as message HTML before they're stored or sent.
+- **Managed categories**: create, recolor, and delete master categories that
+  round-trip to Graph; the reading-pane `+ category` picker now assigns from
+  this managed list (with color chips) instead of free text. Colors use
+  Outlook's preset palette mapped onto Spite's brass/verdigris swatches
+  (oxblood stays reserved for the app accent). Categories **can't be renamed**
+  — that's a Graph limitation (`displayName` is immutable; only `color` is
+  writable), so renaming means delete + recreate. A category left on a message
+  after its definition is deleted still shows (as a neutral chip) and stays
+  removable.
+- **Working hours / timezone / date format** are read from the mailbox and
+  surfaced read-only — groundwork so the future calendar renders in your own
+  timezone.
+- Scope: this adds exactly `MailboxSettings.ReadWrite`. Optimistic updates roll
+  back with a banner if the server rejects a write. Mailbox rules
+  (`messageRules`) are a later run.
+
 ## Search
 
 - **Local-first**: instant, ranked, highlighted full-text search (SQLite
@@ -155,6 +181,8 @@ the variable to `0` before launching.
 - [x] Phase 4 — read UI (offline-capable list + message view)
 - [ ] Phase 5 — compose + send
 - [x] Phase 6 — local full-text search (FTS5)
+- [ ] Phase 7 — mail management (read/flag/move/archive/delete, drafts, bulk)
+- [ ] Phase 8A — mailbox settings (out-of-office, categories, working hours)
 
 ## License
 

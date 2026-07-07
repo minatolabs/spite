@@ -20,15 +20,17 @@ use crate::config::AppConfig;
 use crate::graph;
 use token_store::TokenStore;
 
-/// Delegated Graph scopes. `Mail.ReadWrite` (Phase 7) is the only scope
-/// escalation since Phase 1 — deliberately nothing broader (no `.Shared`,
-/// no `.All`). Adding it means an existing refresh token no longer covers
-/// the request set, so the next sign-in needs fresh consent (see
-/// `AuthError::ConsentRequired`).
-pub const SCOPES: [&str; 5] = [
+/// Delegated Graph scopes. Escalations are deliberately minimal and never
+/// broader than the exact permission needed — no `.Shared`, no `.All`.
+/// `Mail.ReadWrite` arrived in Phase 7; `MailboxSettings.ReadWrite` in
+/// Phase 8A (out-of-office, master categories, working-hours read). Adding a
+/// scope means an existing refresh token no longer covers the request set, so
+/// the next sign-in needs fresh consent (see `AuthError::ConsentRequired`).
+pub const SCOPES: [&str; 6] = [
     "https://graph.microsoft.com/Mail.Read",
     "https://graph.microsoft.com/Mail.ReadWrite",
     "https://graph.microsoft.com/Mail.Send",
+    "https://graph.microsoft.com/MailboxSettings.ReadWrite",
     "https://graph.microsoft.com/User.Read",
     "offline_access",
 ];
@@ -336,8 +338,9 @@ mod tests {
     #[test]
     fn scopes_include_readwrite_and_offline() {
         assert!(SCOPES.contains(&"https://graph.microsoft.com/Mail.ReadWrite"));
+        assert!(SCOPES.contains(&"https://graph.microsoft.com/MailboxSettings.ReadWrite"));
         assert!(SCOPES.contains(&"offline_access"));
-        // Nothing broader than a plain delegated Mail.ReadWrite.
+        // Nothing broader than plain delegated ReadWrite scopes.
         assert!(SCOPES
             .iter()
             .all(|s| !s.contains(".Shared") && !s.contains(".All")));

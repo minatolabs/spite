@@ -9,6 +9,7 @@ use spite_core::config::AppConfig;
 use spite_core::graph::{DraftHandle, GraphMailSource, ServerHit};
 use spite_core::ops::{execute_batch, execute_op, MailOp};
 use spite_core::sanitize::sanitize_html;
+use spite_core::settings::{is_offered_preset, AutomaticReplies, MailboxSettings, MasterCategory};
 use spite_core::store::{
     build_kql, Folder, MailStore, MailStoreError, Message, MessageSummary, SavedSearch,
     SearchFilters, SearchHit, SqliteMailStore, SyncState,
@@ -1033,6 +1034,193 @@ async fn set_signature(
     .await
 }
 
+// --- Phase 8A: mailbox settings (out-of-office, master categories, working
+// hours). Account-level singular config, so these are plain load/save command
+// pairs modeled on get_signature/set_signature — not the per-message OpQueue.
+// Reads cache to the local `settings` KV table so the pane and category picker
+// still render offline. ---
+
+fn signed_in_upn(auth: &Authenticator) -> Result<String, String> {
+    Ok(auth
+        .current_account()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "not signed in".to_string())?
+        .upn)
+}
+
+/// Re-list the master categories from Graph and refresh the local cache.
+/// Shared by list/create/recolor/delete so every mutation returns the fresh
+/// authoritative list and the cache stays coherent.
+async fn list_and_cache_categories(
+    auth: &Arc<Authenticator>,
+    store: &Arc<dyn MailStore>,
+    upn: &str,
+) -> Result<Vec<MasterCategory>, String> {
+    let source = GraphMailSource::new(Arc::clone(auth));
+    let cats = source
+        .list_master_categories()
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Ok(json) = serde_json::to_string(&cats) {
+        let (acct, json) = (upn.to_string(), json);
+        let _ = store_call(store, move |s| {
+            s.set_setting(&acct, "master_categories", &json)
+        })
+        .await;
+    }
+    Ok(cats)
+}
+
+#[tauri::command]
+async fn get_mailbox_settings(
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<MailboxSettings, String> {
+    let upn = signed_in_upn(&auth)?;
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    match source.get_mailbox_settings().await {
+        Ok(s) => {
+            let days = s
+                .working_hours
+                .as_ref()
+                .map(|w| w.days_of_week.len())
+                .unwrap_or(0);
+            tracing::info!(
+                time_zone = %s.time_zone,
+                date_format = %s.date_format,
+                time_format = %s.time_format,
+                working_days = days,
+                "mailbox settings read from Graph"
+            );
+            if let Ok(json) = serde_json::to_string(&s) {
+                let (acct, json) = (upn.clone(), json);
+                let _ = store_call(&store, move |st| {
+                    st.set_setting(&acct, "mailbox_settings", &json)
+                })
+                .await;
+            }
+            Ok(s)
+        }
+        // Offline (or a transient error): fall back to the cached blob so the
+        // pane still opens. Only surface the error if nothing is cached.
+        Err(e) => {
+            let acct = upn.clone();
+            let cached =
+                store_call(&store, move |st| st.get_setting(&acct, "mailbox_settings")).await?;
+            match cached.and_then(|j| serde_json::from_str::<MailboxSettings>(&j).ok()) {
+                Some(s) => Ok(s),
+                None => Err(e.to_string()),
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn set_automatic_replies(
+    replies: AutomaticReplies,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<(), String> {
+    let upn = signed_in_upn(&auth)?;
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    // Graph sanitizes the HTML bodies before the PATCH; on failure the caller
+    // rolls back optimistic UI state and surfaces the error.
+    source
+        .patch_automatic_replies(&replies)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Keep the cached settings blob coherent with what we just committed
+    // (store the sanitized form the server received).
+    let acct = upn.clone();
+    let cached = store_call(&store, move |st| st.get_setting(&acct, "mailbox_settings")).await?;
+    let mut settings = cached
+        .and_then(|j| serde_json::from_str::<MailboxSettings>(&j).ok())
+        .unwrap_or_default();
+    settings.automatic_replies_setting = replies.sanitized();
+    if let Ok(json) = serde_json::to_string(&settings) {
+        let (acct, json) = (upn, json);
+        let _ = store_call(&store, move |st| {
+            st.set_setting(&acct, "mailbox_settings", &json)
+        })
+        .await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_master_categories(
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<MasterCategory>, String> {
+    let upn = signed_in_upn(&auth)?;
+    match list_and_cache_categories(&auth, &store, &upn).await {
+        Ok(cats) => Ok(cats),
+        // Offline: serve the cached list rather than an empty picker.
+        Err(e) => {
+            let acct = upn.clone();
+            let cached =
+                store_call(&store, move |st| st.get_setting(&acct, "master_categories")).await?;
+            match cached.and_then(|j| serde_json::from_str::<Vec<MasterCategory>>(&j).ok()) {
+                Some(cats) => Ok(cats),
+                None => Err(e),
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn create_master_category(
+    display_name: String,
+    color: String,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<MasterCategory>, String> {
+    if !is_offered_preset(&color) {
+        return Err(format!("unsupported category color: {color}"));
+    }
+    let upn = signed_in_upn(&auth)?;
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    source
+        .create_master_category(&display_name, &color)
+        .await
+        .map_err(|e| e.to_string())?;
+    list_and_cache_categories(&auth, &store, &upn).await
+}
+
+#[tauri::command]
+async fn set_master_category_color(
+    id: String,
+    color: String,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<MasterCategory>, String> {
+    if !is_offered_preset(&color) {
+        return Err(format!("unsupported category color: {color}"));
+    }
+    let upn = signed_in_upn(&auth)?;
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    source
+        .set_master_category_color(&id, &color)
+        .await
+        .map_err(|e| e.to_string())?;
+    list_and_cache_categories(&auth, &store, &upn).await
+}
+
+#[tauri::command]
+async fn delete_master_category(
+    id: String,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<MasterCategory>, String> {
+    let upn = signed_in_upn(&auth)?;
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    source
+        .delete_master_category(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    list_and_cache_categories(&auth, &store, &upn).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebKitGTK's accelerated compositing crashes the WebKitWebProcess on
@@ -1121,6 +1309,12 @@ pub fn run() {
             get_keymap,
             get_auto_read_dwell,
             repair_summaries,
+            get_mailbox_settings,
+            set_automatic_replies,
+            list_master_categories,
+            create_master_category,
+            set_master_category_color,
+            delete_master_category,
             apply_op,
             queue_op,
             queue_bulk_op,

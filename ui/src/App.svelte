@@ -40,9 +40,10 @@
     invoke<Account>('silent_sign_in')
       .then((a) => (account = a))
       .catch((e) => {
-        // A scope escalation (Phase 7's Mail.ReadWrite) makes the cached
-        // token insufficient; the shell reports this distinctly so we can
-        // ask for re-consent rather than showing a generic sign-in.
+        // A scope escalation (Phase 7's Mail.ReadWrite, Phase 8A's
+        // MailboxSettings.ReadWrite) makes the cached token insufficient; the
+        // shell reports this distinctly so we can ask for re-consent rather
+        // than showing a generic sign-in.
         if (String(e).toLowerCase().includes('permission to manage your mail')) {
           consentRequired = true
         }
@@ -92,7 +93,8 @@
       {#if consentRequired}
         <p class="consent">
           Spite needs permission to manage your mail (read, flag, move, delete,
-          and drafts). Sign in again to grant it — your account stays connected.
+          and drafts) and your mailbox settings (out-of-office and categories).
+          Sign in again to grant it — your account stays connected.
         </p>
       {/if}
       <button class="sp-btn sp-btn--primary" onclick={signIn} disabled={busy}>

@@ -30,6 +30,13 @@
     type MessageBody,
   } from './mail.svelte'
   import FolderPicker from './FolderPicker.svelte'
+  import {
+    settings,
+    ensureCategories,
+    createCategory,
+    presetCssVar,
+    CATEGORY_SWATCHES,
+  } from './settings.svelte'
 
   let showMovePicker = $state(false)
 
@@ -40,19 +47,41 @@
     invoke<number>('get_auto_read_dwell')
       .then((ms) => (autoReadMs = ms))
       .catch(() => {})
+    // The picker chooses from managed master categories; load them once.
+    void ensureCategories()
   })
 
-  let addingCategory = $state(false)
-  let newCategory = $state('')
+  let catMenuOpen = $state(false)
+  let creatingName = $state('')
 
-  async function addCategory() {
-    const name = newCategory.trim()
-    if (!name || !message) return
+  // Master categories not already on this message.
+  const availableCats = $derived(
+    settings.categories.filter((c) => !(message?.categories ?? []).includes(c.displayName)),
+  )
+
+  // Chip color for an assigned category name; unknown/deleted → neutral (never
+  // crashes the assign UI, never oxblood).
+  function catColor(name: string): string {
+    const c = settings.categories.find((x) => x.displayName === name)
+    return presetCssVar(c?.color ?? '')
+  }
+
+  async function assignCategory(name: string) {
+    if (!message || message.categories.includes(name)) return
     const next = [...message.categories, name]
     message = { ...message, categories: next }
-    addingCategory = false
-    newCategory = ''
+    catMenuOpen = false
     await setCategories(message.summary.id, next)
+  }
+
+  async function createAndAssign() {
+    const name = creatingName.trim()
+    if (!name) return
+    const ok = await createCategory(name, CATEGORY_SWATCHES[0].preset)
+    if (ok) {
+      creatingName = ''
+      await assignCategory(name)
+    }
   }
 
   async function removeCategory(cat: string) {
@@ -299,28 +328,43 @@
             <button class="sp-btn" onclick={() => focusMove(false)}>Move to Other</button>
           {/if}
         </p>
-        <p class="categories">
+        <div class="categories">
           <Tag size={12} />
           {#each message.categories as cat (cat)}
             <span class="cat">
+              <span class="dot" style="background: var({catColor(cat)})"></span>
               {cat}
               <button class="cat-x" onclick={() => removeCategory(cat)}><X size={10} /></button>
             </span>
           {/each}
-          {#if addingCategory}
-            <input
-              class="cat-input"
-              bind:value={newCategory}
-              onkeydown={(e) => {
-                if (e.key === 'Enter') void addCategory()
-                if (e.key === 'Escape') addingCategory = false
-              }}
-              placeholder="category…"
-            />
-          {:else}
-            <button class="cat-add" onclick={() => (addingCategory = true)}>+ category</button>
-          {/if}
-        </p>
+          <span class="cat-picker">
+            <button class="cat-add" onclick={() => (catMenuOpen = !catMenuOpen)}>+ category</button>
+            {#if catMenuOpen}
+              <div class="cat-menu">
+                {#each availableCats as c (c.id)}
+                  <button class="cat-opt" onclick={() => assignCategory(c.displayName)}>
+                    <span class="dot" style="background: var({presetCssVar(c.color)})"></span>
+                    {c.displayName}
+                  </button>
+                {/each}
+                {#if availableCats.length === 0}
+                  <span class="cat-empty">No more categories</span>
+                {/if}
+                <div class="cat-new">
+                  <input
+                    class="cat-input"
+                    bind:value={creatingName}
+                    placeholder="New category…"
+                    onkeydown={(e) => {
+                      if (e.key === 'Enter') void createAndAssign()
+                      if (e.key === 'Escape') catMenuOpen = false
+                    }}
+                  />
+                </div>
+              </div>
+            {/if}
+          </span>
+        </div>
       </header>
     {/if}
 
@@ -491,6 +535,67 @@
     font-size: var(--sp-fs-caption);
     padding: 2px var(--sp-2);
     outline: none;
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    box-shadow: var(--sp-bevel);
+    flex: none;
+  }
+
+  .cat-picker {
+    position: relative;
+    display: inline-flex;
+  }
+
+  .cat-menu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: var(--sp-z-popover, 200);
+    margin-top: 3px;
+    min-width: 160px;
+    padding: var(--sp-1);
+    background: var(--sp-surface-raised);
+    border: 1px solid var(--sp-border-hard);
+    border-radius: var(--sp-r-control);
+    box-shadow: var(--sp-lift);
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .cat-opt {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-1) var(--sp-2);
+    border: none;
+    background: none;
+    color: var(--sp-text-primary);
+    font: inherit;
+    font-size: var(--sp-fs-caption);
+    text-align: left;
+    cursor: pointer;
+    border-radius: var(--sp-r-control);
+  }
+
+  .cat-opt:hover {
+    background: var(--sp-surface-well);
+  }
+
+  .cat-empty {
+    padding: var(--sp-1) var(--sp-2);
+    color: var(--sp-text-tertiary);
+    font-size: var(--sp-fs-caption);
+  }
+
+  .cat-new {
+    padding: var(--sp-1);
+    border-top: var(--sp-stitch);
+    margin-top: 2px;
   }
 
   .images-bar {

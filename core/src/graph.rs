@@ -12,6 +12,7 @@ use base64::Engine;
 use crate::auth::{AuthError, Authenticator};
 use crate::compose::{parse_references, EmailAddress, ReplyContext};
 use crate::ops::{BatchSub, MailBatchWriter, MailWriter, SubResult};
+use crate::settings::{AutomaticReplies, MailboxSettings, MasterCategory};
 use crate::store::{Folder, Message, MessageSummary};
 use crate::sync::{DeltaPage, DeltaRequest, MailSource, PageToken, SourceError};
 
@@ -951,6 +952,86 @@ impl MailBatchWriter for GraphMailSource {
                 })
             })
             .collect())
+    }
+}
+
+/// Graph collection envelope: `{ "value": [ ... ] }`.
+#[derive(Debug, Deserialize)]
+struct GraphList<T> {
+    #[serde(default = "Vec::new")]
+    value: Vec<T>,
+}
+
+/// Mailbox settings + master categories (Phase 8A). These are account-level,
+/// not per-message, so they don't go through `MailOp`/`$batch` — they reuse
+/// `get_json`/`send_authed` directly with the same auth + error mapping.
+impl GraphMailSource {
+    /// `GET /me/mailboxSettings` — out-of-office, working hours, timezone,
+    /// date/time format.
+    pub async fn get_mailbox_settings(&self) -> Result<MailboxSettings, SourceError> {
+        let url = format!("{GRAPH_BASE}/me/mailboxSettings");
+        self.get_json(&url, &[], None).await
+    }
+
+    /// `PATCH /me/mailboxSettings` updating just `automaticRepliesSetting`. The
+    /// reply bodies are HTML and are sanitized here (in Rust) before they ever
+    /// leave the app — the UI never gets to bypass the sanitizer.
+    pub async fn patch_automatic_replies(
+        &self,
+        replies: &AutomaticReplies,
+    ) -> Result<(), SourceError> {
+        let clean = replies.sanitized();
+        let body = serde_json::json!({ "automaticRepliesSetting": clean });
+        let url = format!("{GRAPH_BASE}/me/mailboxSettings");
+        self.send_authed(|| self.http.patch(&url).json(&body))
+            .await?;
+        Ok(())
+    }
+
+    /// `GET /me/outlook/masterCategories` — the mailbox's managed category list.
+    pub async fn list_master_categories(&self) -> Result<Vec<MasterCategory>, SourceError> {
+        let url = format!("{GRAPH_BASE}/me/outlook/masterCategories");
+        let list: GraphList<MasterCategory> = self.get_json(&url, &[], None).await?;
+        Ok(list.value)
+    }
+
+    /// `POST /me/outlook/masterCategories` — returns the created category with
+    /// its server-assigned id.
+    pub async fn create_master_category(
+        &self,
+        display_name: &str,
+        color: &str,
+    ) -> Result<MasterCategory, SourceError> {
+        let url = format!("{GRAPH_BASE}/me/outlook/masterCategories");
+        let body = serde_json::json!({ "displayName": display_name, "color": color });
+        let resp = self
+            .send_authed(|| self.http.post(&url).json(&body))
+            .await?;
+        resp.json()
+            .await
+            .map_err(|e| SourceError::Protocol(e.to_string()))
+    }
+
+    /// `PATCH /me/outlook/masterCategories/{id}` — only `color` is writable
+    /// (Graph won't rename a category; `displayName` is immutable).
+    pub async fn set_master_category_color(
+        &self,
+        id: &str,
+        color: &str,
+    ) -> Result<(), SourceError> {
+        let url = format!("{GRAPH_BASE}/me/outlook/masterCategories/{id}");
+        let body = serde_json::json!({ "color": color });
+        self.send_authed(|| self.http.patch(&url).json(&body))
+            .await?;
+        Ok(())
+    }
+
+    /// `DELETE /me/outlook/masterCategories/{id}`. Note Graph leaves the
+    /// category string on any messages already tagged with it (no cascade).
+    pub async fn delete_master_category(&self, id: &str) -> Result<(), SourceError> {
+        let url = format!("{GRAPH_BASE}/me/outlook/masterCategories/{id}");
+        self.send_authed(|| self.http.delete(&url)).await?;
+        Ok(())
     }
 }
 

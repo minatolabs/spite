@@ -8,6 +8,7 @@ pub mod config;
 pub mod graph;
 pub mod ops;
 pub mod sanitize;
+pub mod settings;
 pub mod store;
 pub mod sync;
 

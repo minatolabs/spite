@@ -233,6 +233,10 @@ pub trait MailStore: Send + Sync {
     fn get_signature(&self, account: &str, kind: &str) -> Result<Option<String>, MailStoreError>;
     fn set_signature(&self, account: &str, kind: &str, content: &str)
         -> Result<(), MailStoreError>;
+    /// Account-scoped key/value settings (Phase 8A). Values are opaque JSON
+    /// blobs (mailbox settings, cached master-category list).
+    fn get_setting(&self, account: &str, key: &str) -> Result<Option<String>, MailStoreError>;
+    fn set_setting(&self, account: &str, key: &str, value: &str) -> Result<(), MailStoreError>;
     /// Ranked, highlighted full-text search. An empty/whitespace query with
     /// filters set is a filtered browse (newest first).
     fn search(
@@ -428,6 +432,18 @@ fn migration_steps() -> Vec<M<'static>> {
         ALTER TABLE messages ADD COLUMN categories TEXT NOT NULL DEFAULT '[]';
         ALTER TABLE messages ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0;
         UPDATE sync_state SET delta_link = NULL;",
+        ),
+        // v7 (Phase 8A): account-scoped key/value store for mailbox settings.
+        // Holds JSON blobs (out-of-office settings, the master-category list)
+        // cached from Graph so the settings pane and category picker still
+        // render offline. Not synced from message deltas — no cursor reset.
+        M::up(
+            "CREATE TABLE settings (
+            account TEXT NOT NULL,
+            key     TEXT NOT NULL,
+            value   TEXT NOT NULL,
+            PRIMARY KEY (account, key)
+        ) WITHOUT ROWID;",
         ),
     ]
 }
@@ -869,6 +885,28 @@ impl MailStore for SqliteMailStore {
         Ok(())
     }
 
+    fn get_setting(&self, account: &str, key: &str) -> Result<Option<String>, MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let value = conn
+            .query_row(
+                "SELECT value FROM settings WHERE account = ?1 AND key = ?2",
+                params![account, key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    fn set_setting(&self, account: &str, key: &str, value: &str) -> Result<(), MailStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (account, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account, key) DO UPDATE SET value = excluded.value",
+            params![account, key, value],
+        )?;
+        Ok(())
+    }
+
     fn search(
         &self,
         query: &str,
@@ -1184,6 +1222,8 @@ pub struct MemoryMailStore {
     contacts: Mutex<HashMap<String, (String, u32, i64)>>,
     /// (account, kind) → content
     signatures: Mutex<HashMap<(String, String), String>>,
+    /// (account, key) → JSON value blob
+    settings: Mutex<HashMap<(String, String), String>>,
     /// Non-mail documents added via index_document.
     documents: Mutex<Vec<MemoryDoc>>,
     saved_searches: Mutex<Vec<SavedSearch>>,
@@ -1411,6 +1451,23 @@ impl MailStore for MemoryMailStore {
             .lock()
             .unwrap()
             .insert((account.to_string(), kind.to_string()), content.to_string());
+        Ok(())
+    }
+
+    fn get_setting(&self, account: &str, key: &str) -> Result<Option<String>, MailStoreError> {
+        Ok(self
+            .settings
+            .lock()
+            .unwrap()
+            .get(&(account.to_string(), key.to_string()))
+            .cloned())
+    }
+
+    fn set_setting(&self, account: &str, key: &str, value: &str) -> Result<(), MailStoreError> {
+        self.settings
+            .lock()
+            .unwrap()
+            .insert((account.to_string(), key.to_string()), value.to_string());
         Ok(())
     }
 
@@ -1966,7 +2023,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
@@ -1983,8 +2040,45 @@ mod tests {
             "signatures",
             "saved_searches",
             "search_index",
+            "settings",
         ] {
             assert!(tables.iter().any(|t| t == required), "missing {required}");
+        }
+    }
+
+    #[test]
+    fn settings_kv_round_trips_in_both_stores() {
+        // Same behavior across the SQLite and in-memory impls.
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = SqliteMailStore::open(dir.path().join("s.db")).unwrap();
+        let mem = MemoryMailStore::default();
+        let stores: [&dyn MailStore; 2] = [&sqlite, &mem];
+        for store in stores {
+            assert_eq!(
+                store.get_setting("u@x.com", "mailbox_settings").unwrap(),
+                None
+            );
+            store
+                .set_setting("u@x.com", "mailbox_settings", r#"{"a":1}"#)
+                .unwrap();
+            assert_eq!(
+                store.get_setting("u@x.com", "mailbox_settings").unwrap(),
+                Some(r#"{"a":1}"#.to_string())
+            );
+            // Upsert overwrites; a different account is isolated.
+            store
+                .set_setting("u@x.com", "mailbox_settings", r#"{"a":2}"#)
+                .unwrap();
+            assert_eq!(
+                store.get_setting("u@x.com", "mailbox_settings").unwrap(),
+                Some(r#"{"a":2}"#.to_string())
+            );
+            assert_eq!(
+                store
+                    .get_setting("other@x.com", "mailbox_settings")
+                    .unwrap(),
+                None
+            );
         }
     }
 

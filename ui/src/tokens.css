@@ -106,6 +106,18 @@
   --sp-success:         var(--verd-300);
   --sp-flag:            var(--brass-300);
 
+  /* Category swatches — Graph presets mapped onto the brass/verdigris family.
+     Oxblood stays reserved for the app accent; presets outside this set (reds,
+     cranberries, None) render as --sp-cat-neutral. Built on primitives so the
+     parchment theme inherits them unchanged. */
+  --sp-cat-brass:    var(--brass-300);  /* preset1  Orange   */
+  --sp-cat-gold:     var(--brass-400);  /* preset3  Yellow   */
+  --sp-cat-bronze:   #8a6a34;           /* preset2  Brown    */
+  --sp-cat-verd:     var(--verd-300);   /* preset5  Teal     */
+  --sp-cat-patina:   var(--verd-400);   /* preset4  Green    */
+  --sp-cat-deepverd: #244838;           /* preset20 DarkTeal */
+  --sp-cat-neutral:  var(--bone-600);   /* reserved/unknown  */
+
   /* Borders and stitching */
   --sp-border-hard:     #000000;                        /* panel seams */
   --sp-border-control:  #050403;                        /* button outlines */
