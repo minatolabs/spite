@@ -11,9 +11,11 @@
   import ReadingPane from './ReadingPane.svelte'
   import SearchBar from './SearchBar.svelte'
   import SendToasts from './SendToasts.svelte'
+  import RulesPane from './RulesPane.svelte'
   import SettingsPane from './SettingsPane.svelte'
   import SignatureSettings from './SignatureSettings.svelte'
   import StatusBar from './StatusBar.svelte'
+  import { setAccountDomain } from './rules.svelte'
   import {
     archive,
     clearSearch,
@@ -33,6 +35,12 @@
 
   let showSignatures = $state(false)
   let showSettings = $state(false)
+  let showRules = $state(false)
+
+  // "External" for rule forwards = a different domain than this account.
+  // Deliberate initial capture: Shell remounts per signed-in account.
+  // svelte-ignore state_referenced_locally
+  setAccountDomain(account.upn)
 
   function composeNew() {
     void invoke('open_compose', { mode: 'new', messageId: null })
@@ -199,7 +207,17 @@
   {/if}
 
   {#if showSettings}
-    <SettingsPane onclose={() => (showSettings = false)} />
+    <SettingsPane
+      onclose={() => (showSettings = false)}
+      onopenrules={() => {
+        showSettings = false
+        showRules = true
+      }}
+    />
+  {/if}
+
+  {#if showRules}
+    <RulesPane onclose={() => (showRules = false)} />
   {/if}
 
   <SendToasts />

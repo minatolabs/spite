@@ -1035,6 +1035,59 @@ impl GraphMailSource {
     }
 }
 
+/// Message rules (Phase 8B). Same `MailboxSettings.ReadWrite` scope as Run A.
+/// Rules are scoped to the Inbox — the standard case; other folders are a
+/// later extension. Writes use `rules::patch_body`/`create_body`, which carry
+/// the conditions/exceptions/actions objects whole (round-trip safety — a
+/// Graph PATCH replaces those complex properties entirely when included).
+impl GraphMailSource {
+    /// `GET /me/mailFolders/inbox/messageRules`. Rules lists are tiny
+    /// (Exchange caps rules by total size) — no paging.
+    pub async fn list_message_rules(&self) -> Result<Vec<crate::rules::MessageRule>, SourceError> {
+        let url = format!("{GRAPH_BASE}/me/mailFolders/inbox/messageRules");
+        let list: GraphList<crate::rules::MessageRule> = self.get_json(&url, &[], None).await?;
+        Ok(list.value)
+    }
+
+    /// `POST /me/mailFolders/inbox/messageRules` — returns the created rule
+    /// with its server-assigned id.
+    pub async fn create_message_rule(
+        &self,
+        rule: &crate::rules::MessageRule,
+    ) -> Result<crate::rules::MessageRule, SourceError> {
+        let url = format!("{GRAPH_BASE}/me/mailFolders/inbox/messageRules");
+        let body = crate::rules::create_body(rule);
+        let resp = self
+            .send_authed(|| self.http.post(&url).json(&body))
+            .await?;
+        resp.json()
+            .await
+            .map_err(|e| SourceError::Protocol(e.to_string()))
+    }
+
+    /// `PATCH /me/mailFolders/inbox/messageRules/{id}` with exactly the six
+    /// writable properties (complex objects whole; server-owned fields never
+    /// echoed back).
+    pub async fn update_message_rule(
+        &self,
+        id: &str,
+        rule: &crate::rules::MessageRule,
+    ) -> Result<(), SourceError> {
+        let url = format!("{GRAPH_BASE}/me/mailFolders/inbox/messageRules/{id}");
+        let body = crate::rules::patch_body(rule);
+        self.send_authed(|| self.http.patch(&url).json(&body))
+            .await?;
+        Ok(())
+    }
+
+    /// `DELETE /me/mailFolders/inbox/messageRules/{id}`.
+    pub async fn delete_message_rule(&self, id: &str) -> Result<(), SourceError> {
+        let url = format!("{GRAPH_BASE}/me/mailFolders/inbox/messageRules/{id}");
+        self.send_authed(|| self.http.delete(&url)).await?;
+        Ok(())
+    }
+}
+
 impl MailSource for GraphMailSource {
     async fn backfill_cutoff(&self, folder_id: &str, n: u32) -> Result<i64, SourceError> {
         let n = n.clamp(1, 1000);

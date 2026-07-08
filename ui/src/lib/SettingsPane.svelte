@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { Trash2 } from 'lucide-svelte'
+  import { AlertTriangle, Trash2 } from 'lucide-svelte'
   import RichBodyEditor from './RichBodyEditor.svelte'
+  import { rules, ensureRules, externalForwardRuleCount } from './rules.svelte'
   import {
     settings,
     loadMailboxSettings,
@@ -14,7 +15,7 @@
     type AutomaticReplies,
   } from './settings.svelte'
 
-  let { onclose }: { onclose: () => void } = $props()
+  let { onclose, onopenrules }: { onclose: () => void; onopenrules: () => void } = $props()
 
   // Pane-local, editable copy of the out-of-office settings, seeded once from
   // the loaded server state.
@@ -36,6 +37,7 @@
 
   onMount(() => {
     void loadMailboxSettings()
+    void ensureRules()
   })
 
   // Graph dateTime ("2026-07-06T07:00:00.0000000") ⇆ datetime-local ("…T07:00").
@@ -232,7 +234,32 @@
         </div>
       </section>
 
-      <!-- 3. Working hours / timezone / format (read-only) -->
+      <!-- 3. Inbox rules (managed in their own pane) -->
+      <section>
+        <h3>Rules</h3>
+        <p class="note">
+          {#if rules.loaded}
+            {rules.list.length} inbox rule{rules.list.length === 1 ? '' : 's'} — they run
+            server-side, even when Spite is closed.
+          {:else}
+            Server-side inbox rules — they run even when Spite is closed.
+          {/if}
+        </p>
+        {#if externalForwardRuleCount() > 0}
+          <!-- Standing anti-exfiltration indicator: external auto-forwards are
+               never invisible, even if planted from another client. -->
+          <p class="ext-warn">
+            <AlertTriangle size={12} />
+            {externalForwardRuleCount()} rule{externalForwardRuleCount() === 1 ? '' : 's'} forward
+            mail outside your organization.
+          </p>
+        {/if}
+        <div class="actions">
+          <button class="sp-btn" onclick={onopenrules}>Manage rules…</button>
+        </div>
+      </section>
+
+      <!-- 4. Working hours / timezone / format (read-only) -->
       <section>
         <h3>Regional</h3>
         <dl class="regional">
@@ -452,6 +479,15 @@
   .ok {
     color: var(--sp-success);
     font-size: var(--sp-fs-small);
+  }
+
+  .ext-warn {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin: 0 0 var(--sp-2);
+    font-size: var(--sp-fs-small);
+    color: var(--sp-danger);
   }
   .error {
     color: var(--sp-danger);

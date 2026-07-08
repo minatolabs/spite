@@ -140,8 +140,34 @@ Manager), never on disk.
   surfaced read-only — groundwork so the future calendar renders in your own
   timezone.
 - Scope: this adds exactly `MailboxSettings.ReadWrite`. Optimistic updates roll
-  back with a banner if the server rejects a write. Mailbox rules
-  (`messageRules`) are a later run.
+  back with a banner if the server rejects a write. Inbox rules
+  (`messageRules`) live on the same scope — see below.
+
+## Inbox rules
+
+- **Full rules engine** over Graph `messageRules` — the complete condition,
+  exception, and action surface, drag-to-reorder (sequence), and enable
+  toggles. Rules run **server-side**, so they fire even when Spite is closed.
+- **Round-trip safe**: Spite edits the same rules Outlook shows, and saving a
+  rule preserves every field verbatim — including conditions, actions, and
+  recipients the editor doesn't recognize (they're surfaced as "preserved",
+  never silently dropped). A lossy save can't corrupt a rule built elsewhere.
+- **Anti-exfiltration hygiene**: forward/redirect actions are never visually
+  silent. Rule summaries flag them, recipients outside your domain get an
+  explicit "forwards externally" danger treatment, saving such a rule requires
+  a confirm listing the exact addresses, and the settings pane shows a standing
+  "N rules forward mail externally" warning — including rules planted from
+  another client, even read-only ones. Unrecognized actions on a rule are
+  counted in the summary so a rule can't carry an invisible action.
+- **Delete vs permanently delete** are unmistakably distinct: soft delete goes
+  to Deleted Items; permanent delete is labeled unrecoverable and rendered in
+  danger styling in both the picker and the summary.
+- Managed/admin rules (`isReadOnly`) render locked; rules the server flags as
+  broken show an error badge. Multiple conditions are AND'd (Outlook
+  semantics — the editor says so). The list renders offline from the settings
+  cache; edits require network. Rules are Inbox-scoped (Graph's standard
+  case); other folders are a later extension.
+- Scope: still `MailboxSettings.ReadWrite` — no new permission.
 
 ## Search
 
@@ -183,7 +209,7 @@ the variable to `0` before launching.
 - [x] Phase 6 — local full-text search (FTS5)
 - [x] Phase 7 — mail management (read/flag/move/archive/delete, drafts, bulk)
 - [x] Phase 8A — mailbox settings (out-of-office, categories, working hours)
-- [ ] Phase 8B — mailbox rules (messageRules engine)
+- [x] Phase 8B — mailbox rules (messageRules engine)
 - [ ] Phase 9 — calendar
 
 ## License

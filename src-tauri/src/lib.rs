@@ -7,7 +7,8 @@ use spite_core::auth::{Account, Authenticator, DeviceCodePrompt};
 use spite_core::compose::{self, ComposeMode, Draft, EmailAddress};
 use spite_core::config::AppConfig;
 use spite_core::graph::{DraftHandle, GraphMailSource, ServerHit};
-use spite_core::ops::{execute_batch, execute_op, MailOp};
+use spite_core::ops::{execute_batch, execute_op, BatchSub, MailBatchWriter, MailOp};
+use spite_core::rules::MessageRule;
 use spite_core::sanitize::sanitize_html;
 use spite_core::settings::{is_offered_preset, AutomaticReplies, MailboxSettings, MasterCategory};
 use spite_core::store::{
@@ -1221,6 +1222,164 @@ async fn delete_master_category(
     list_and_cache_categories(&auth, &store, &upn).await
 }
 
+// --- Phase 8B: message rules. Same MailboxSettings.ReadWrite scope; same
+// command shape as the Run A category commands — every write re-fetches and
+// returns the fresh authoritative list, and the list caches to the settings
+// KV (key "message_rules") so it renders offline. Edits require network. ---
+
+/// Re-list the inbox message rules from Graph and refresh the local cache.
+async fn list_and_cache_rules(
+    auth: &Arc<Authenticator>,
+    store: &Arc<dyn MailStore>,
+    upn: &str,
+) -> Result<Vec<MessageRule>, String> {
+    let source = GraphMailSource::new(Arc::clone(auth));
+    let rules = source
+        .list_message_rules()
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Ok(json) = serde_json::to_string(&rules) {
+        let (acct, json) = (upn.to_string(), json);
+        let _ = store_call(store, move |s| s.set_setting(&acct, "message_rules", &json)).await;
+    }
+    Ok(rules)
+}
+
+#[tauri::command]
+async fn list_message_rules(
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<MessageRule>, String> {
+    let upn = signed_in_upn(&auth)?;
+    match list_and_cache_rules(&auth, &store, &upn).await {
+        Ok(rules) => Ok(rules),
+        // Offline: serve the cached list rather than nothing.
+        Err(e) => {
+            let acct = upn.clone();
+            let cached =
+                store_call(&store, move |st| st.get_setting(&acct, "message_rules")).await?;
+            match cached.and_then(|j| serde_json::from_str::<Vec<MessageRule>>(&j).ok()) {
+                Some(rules) => Ok(rules),
+                None => Err(e),
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn create_message_rule(
+    rule: MessageRule,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<MessageRule>, String> {
+    let upn = signed_in_upn(&auth)?;
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    let mut rule = rule;
+    // Sequence from a fresh server read (not the UI's possibly-stale list) —
+    // a new rule goes to the end.
+    if rule.sequence.is_none() {
+        let current = source
+            .list_message_rules()
+            .await
+            .map_err(|e| e.to_string())?;
+        let max = current.iter().filter_map(|r| r.sequence).max().unwrap_or(0);
+        rule.sequence = Some(max + 1);
+    }
+    source
+        .create_message_rule(&rule)
+        .await
+        .map_err(|e| e.to_string())?;
+    list_and_cache_rules(&auth, &store, &upn).await
+}
+
+#[tauri::command]
+async fn update_message_rule(
+    rule: MessageRule,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<MessageRule>, String> {
+    let upn = signed_in_upn(&auth)?;
+    let id = rule
+        .id
+        .clone()
+        .ok_or_else(|| "rule has no id".to_string())?;
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    source
+        .update_message_rule(&id, &rule)
+        .await
+        .map_err(|e| e.to_string())?;
+    list_and_cache_rules(&auth, &store, &upn).await
+}
+
+#[tauri::command]
+async fn delete_message_rule(
+    id: String,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<MessageRule>, String> {
+    let upn = signed_in_upn(&auth)?;
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    source
+        .delete_message_rule(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    list_and_cache_rules(&auth, &store, &upn).await
+}
+
+/// Reorder: renumber to contiguous 1..=n (no duplicate/gapped slots by
+/// construction) and PATCH only the changed sequences, batched via the
+/// existing Graph `$batch` writer. Success or failure, the caller gets the
+/// server's authoritative order afterwards — on partial failure this returns
+/// an error and the UI re-fetches + repaints rather than trusting the
+/// optimistic order.
+#[tauri::command]
+async fn reorder_message_rules(
+    ordered_ids: Vec<String>,
+    auth: State<'_, Arc<Authenticator>>,
+    store: State<'_, Arc<dyn MailStore>>,
+) -> Result<Vec<MessageRule>, String> {
+    let upn = signed_in_upn(&auth)?;
+    let source = GraphMailSource::new(Arc::clone(&auth));
+    // Compute against a fresh server read, not the UI's list.
+    let current = source
+        .list_message_rules()
+        .await
+        .map_err(|e| e.to_string())?;
+    let patches = spite_core::rules::sequence_patches(&current, &ordered_ids);
+    let mut failures = 0usize;
+    for chunk in patches.chunks(spite_core::ops::BATCH_CHUNK) {
+        let subs: Vec<BatchSub> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, (id, seq))| BatchSub {
+                index: i,
+                method: "PATCH",
+                url: format!("/me/mailFolders/inbox/messageRules/{id}"),
+                body: Some(serde_json::json!({ "sequence": seq })),
+            })
+            .collect();
+        match source.execute_chunk(&subs).await {
+            Ok(results) => {
+                failures += results
+                    .iter()
+                    .filter(|r| !(200..300).contains(&r.status))
+                    .count();
+                // A sub-request with no response is a failure, not a success.
+                failures += subs.len().saturating_sub(results.len());
+            }
+            Err(_) => failures += subs.len(),
+        }
+    }
+    let rules = list_and_cache_rules(&auth, &store, &upn).await?;
+    if failures > 0 {
+        return Err(format!(
+            "{failures} of {} sequence updates failed — order restored from the server",
+            patches.len()
+        ));
+    }
+    Ok(rules)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebKitGTK's accelerated compositing crashes the WebKitWebProcess on
@@ -1315,6 +1474,11 @@ pub fn run() {
             create_master_category,
             set_master_category_color,
             delete_master_category,
+            list_message_rules,
+            create_message_rule,
+            update_message_rule,
+            delete_message_rule,
+            reorder_message_rules,
             apply_op,
             queue_op,
             queue_bulk_op,
